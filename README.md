@@ -134,7 +134,7 @@ ET_CORE：核心文件
 
 换句话说，当elf格式的文件存储在磁盘中时，处理器“眼中”的文件是这样的：
 
-![elf relocatable](.\image\elf_relocatable.png)
+![elf relocatable](./image/elf_relocatable.png)
 
 而当elf格式的文件要加载运行时，处理器“眼中”的ELF文件是这样的：
 
