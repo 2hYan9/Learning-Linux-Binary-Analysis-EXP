@@ -4262,6 +4262,13 @@ int main()
 
 加载完成后，将目标进程的PC设置为payload的程序入口点，并让目标进程执行，然而，此时的目标进程继续执行会出现segmentation fault。
 
+如下面的示意图所示：
+
+！[code_injection_fault](./image/code_injection_fault.png)
+
+其中带数字的线表示程序的控制流。在最后一步的控制流转移的时候，如果将host的控制转移到匿名内存空间，将会出现segmentation fault；而如果将控制转移到host原来的位置，并且恢复host的%rsp和%rbp寄存器后，程序能够回到原来的位置继续执行。
+
+这个问题暂时还没有得到一个有效的解决方法。
 
 ### Ptrace反调试技巧
 
