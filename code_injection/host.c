@@ -2,6 +2,7 @@
 /* gcc host.c -o host */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <sys/mman.h>
 
@@ -16,5 +17,5 @@ int main()
     printf("mapped over.\n");
     sleep(20);
     */
-    return 0;
+    exit(0);
 }
