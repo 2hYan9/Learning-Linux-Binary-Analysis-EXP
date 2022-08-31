@@ -4264,7 +4264,7 @@ int main()
 
 如下面的示意图所示：
 
-！[code_injection_fault](./image/code_injection_fault.png)
+![code_injection_fault](./image/code_injection_fault.png)
 
 其中带数字的线表示程序的控制流。在最后一步的控制流转移的时候，如果将host的控制转移到匿名内存空间，将会出现segmentation fault；而如果将控制转移到host原来的位置，并且恢复host的%rsp和%rbp寄存器后，程序能够回到原来的位置继续执行。
 
