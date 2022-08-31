@@ -4268,7 +4268,7 @@ int main()
 
 其中带数字的线表示程序的控制流。其中以PC为起始点的控制转移路线是指追踪host程序的code_inect程序修改host的PC所进行的控制转移，而第2次控制转移是host程序被shellcode中的"int3"指令中断后将控制返回到code_inject程序。
 
-在最后一步的控制流转移的时候，如果将host的控制转移到匿名内存空间，将会出现segmentation fault；而如果将控制转移到host原来的位置，并且恢复host的%rsp和%rbp寄存器后，程序能够回到原来的位置继续执行。
+在最后一步的控制流转移的时候，如果将host的控制转移到匿名内存空间，将会出现segmentation fault，事实上，转移到除原来的PC位置以外的任何位置都会造成一个segmentation fault；而如果将控制转移到host原来的位置，并且恢复host的%rsp和%rbp寄存器后，程序能够回到原来的位置继续执行。
 
 这个问题暂时还没有得到一个有效的解决方法。
 
