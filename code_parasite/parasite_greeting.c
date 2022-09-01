@@ -1,3 +1,7 @@
+/* parasite_greeting.c 
+ * parasite a shellcode to the host.
+ * Usage: ./parasite_greeting <host_file> 
+*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -18,17 +22,17 @@ static volatile inline void
 _write(int fd, char *buffer, unsigned int len)
 {
     __asm__ volatile(
+        /* write(1, "[I'm in here]\n", 14) */
         "mov %0, %%edi\n"
         "mov %1, %%rsi\n"
         "mov %2, %%edx\n"
         "mov $1, %%rax\n"
         "syscall\n"
         /* exit(0) */
-        /*
         "mov $0, %%edi\n"
         "mov $60, %%rax\n"
         "syscall\n"
-        */
+        
         : 
         : "g"(fd), "g"(buffer), "g"(len)
     );
@@ -40,14 +44,14 @@ void parasite_greeting()
     ' ', 'i', 'n', ' ', 'h', 'e', 'r', 'e', ']','\n', '\0'};
     _write(1, str, 14);
     
+    /*
     __asm__ volatile(
-        "mov $0x401070, %%rax\n"
+        "mov $0x401178, %%rax\n"
         "jmp *%%rax\n"
         :
         : 
     );
-    
-    
+    */
 }
 
 uint8_t *create_shellcode(void (*fn)(),size_t len)
@@ -124,11 +128,8 @@ int main(int argc, char *argv[])
         perror("write");
         exit(-1);
     }
-    /*
+    /* patch the shellcode, but here we have a fixed entry point of host
     *(uint32_t *)&shellcode[PATCH_OFFSET] = old_entry;
-    
-    for(i = PATCH_OFFSET; i < parasite_len; i++) printf("%x ", shellcode[i]);
-    printf("\n");
     */
     if(lseek(fd, parasite_off, SEEK_SET) < 0)
     {

