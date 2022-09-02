@@ -28,11 +28,13 @@ _write(int fd, char *buffer, unsigned int len)
         "mov %2, %%edx\n"
         "mov $1, %%rax\n"
         "syscall\n"
+        /* jump to the original entry point of host */
+        "mov $0x401070, %%rax\n"
+        "jmp *%%rax\n"
         /* exit(0) */
         "mov $0, %%edi\n"
         "mov $60, %%rax\n"
         "syscall\n"
-        
         : 
         : "g"(fd), "g"(buffer), "g"(len)
     );
