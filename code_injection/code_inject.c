@@ -287,21 +287,12 @@ int main(int argc, char *argv[])
     }else
     {
         printf("Shellcode has been injected and executed.\n");
-        printf("old rip: %lx\n", old_rip);
         if(ptrace(PTRACE_GETREGS, h.pid, NULL, &h.pt_reg) < 0)
         {
             perror("PTRACE_GETREGS");
             exit(EXIT_FAILURE);
         }
-        printf("%llx\n", h.pt_reg.rax);
-        printf("current rip: %llx\n", h.pt_reg.rip);
-        char shellcode[] = "xb8\x00\x00\x00\x00\xff\xe0";
-        *(unsigned int *)&shellcode[1] = 0x401165;
-        if(pid_write(h.pid, (void *)(0x40118c), shellcode, 7) < 0)
-        {
-            printf("Failed to load the payload.\n");
-            exit(-1);
-        }
+        printf("return value of shellcode: 0x%llx\n", h.pt_reg.rax);
     }
     
     int fd;
@@ -330,6 +321,11 @@ int main(int argc, char *argv[])
     h.pt_reg.rip = old_rip;
     h.pt_reg.rbp = old_rbp;
     h.pt_reg.rsp = old_rsp;
+    /* Note that current rbp = 0*/
+    
+    // printf("%llx    %lx\n", h.pt_reg.rbp, old_rbp);
+    // printf("%llx    %lx\n", h.pt_reg.rsp, old_rsp);
+    
     if(ptrace(PTRACE_SETREGS, h.pid, NULL, &h.pt_reg) < 0)
     {
         perror("PTRACE_SETREGS");
