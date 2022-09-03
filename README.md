@@ -1416,7 +1416,7 @@ int syscall(SYS_arch_prctl, int code, unsigned long *addr);
 
 CS(Code segment), DS(Data segment), SS(Stack segment), ES(Extra segment), FS, GS
 
-FS和GS没有特定的意义，在不同的操作系统上，有着不同的用途，这些用途都是处理器指定的。
+FS和GS没有特定的意义，在不同的操作系统上，有着不同的用途，这些用途都是处理器指定的。**这里的系统调用以及FS寄存器可能都与Intel的CET技术相关，这在后面的实验中可能会用到。**
 
 而在Linux系统下，FS指向的区域为TLS(Thread Local Storage)，GS指向的区域为PDA(Processor Data Area)。
 
@@ -4271,6 +4271,8 @@ int main()
 在最后一步的控制流转移的时候，如果将host的控制转移到匿名内存空间，将会出现segmentation fault。事实上，转移到除原来的PC位置以外的任何位置都会造成一个segmentation fault；而如果将控制转移到host原来的位置，并且恢复host的%rsp和%rbp寄存器后，程序能够回到原来的位置继续执行。
 
 **也就是说，在修改宿主程序的PC以操控其控制流时，第一次修改没有问题，但是第二次修改只能回到其原来的位置进行执行，否则将会出现段错误**。
+
+**这个问题可能与Intel的CET技术相关，目前的计划是先把这本书的内容过一遍，然后再着手解决这个问题。**
 
 这个问题暂时还没有得到一个有效的解决方法。*这个问题暂时先留着，等以后有机会再解决*。
 
