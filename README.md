@@ -4634,11 +4634,20 @@ int main(int argc, char *argv[])
 ![parasite_greeting_segfault](./image/parasite_greeting_segfault.png)
 
 这里出现和前面代码注入的实验中类似的错误，也就是修改宿主程序的PC以转移其控制流时，宿主程序能够正确执行寄生的代码，但是想要让程序继续执行其原来的代码时，会出现段错误。如下示意图所示：
-> 这里的错误有可能是因为生成的shellcode中包含一些操作栈帧的指令，从而破坏了程序原来的栈帧结构，并造成段错误。
->   
-> 但是使用gdb调试被寄生了代码的宿主程序可以发现，宿主程序在执行完寄生代码后的栈帧结构并没有被破坏。
->  
+
 > 造成这个问题的原因很有可能是Intel所提供的一种基于硬件的保护技术，CET(Control-flow Enforcement Technology)，也就是每个函数执行的第一条endbr64指令，这技术主要是为了保护程序控制流的完整性，具体原理这里不再赘述。目前可以确定的是，这里造成段错误的原因很有可能是因为CET技术。
+>
+> 除了CET，造成这个问题的原因还有可能跟动态链接有关，通过查看_start()函数的源代码可以发现，_start()函数并不是通过绝对地址调用main()函数的，而是通过GOT[0]来调用。在跳转到GOT[0]之前，_start()函数传递了一系列参数。下图是宿主程序在被寄生之前使用GDB调试的结果：
+> ![unparasite_start](./image/unparasite_start.png)
+> 图中的0x403ff0就是GOT[0]的地址。  
+> 在进行了代码寄生后，再次使用GDB进行调试的结果如下：
+> ![parasited_start](./image/parasited_start.png)
+> 可以看到在跳转到GOT[0]前传递的参数中%r9 = 0xe，这个参数是前面的mov %r9, %rdx所提供的，而%rdx在前面的插入的代码中用于传递第三个参数，也就是打印字符的长度。  
+> 在前面没有进行代码寄生的时候，这个寄存器中的值为%r9 = 0x7ffff7fc9040，指向程序的共享库区域中的_dl_fini()函数的地址。
+> 执行下一条指令后，结果如下：
+> ![jump_fault](./image/jump_fault.png)
+> 可以看到在调用了GOT[0]之后，程序的PC跳转到了0xe处执行，从而引发的段错误。
+> 在编译宿主程序时使用-static选项使其进行静态链接，结果或许会有所不同。或者让宿主程序不调用标准库。
 
 ![parasite_greeting_segfault_illustration](./image/parasite_greeting_segfault_illustration.png)
 
@@ -4649,6 +4658,8 @@ int main(int argc, char *argv[])
 ![parasite_greeting](./image/parasite_greeting.png)
 
 如何让宿主程序在执行完寄生代码后继续执行其原来的代码依然是一个待解决的问题。
+
+目前的计划是先将这本书中的内容看一遍，然后再着手解决这个问题，所以后面的代码寄生以及代码注入的实验中，写入的代码都只是打印一句greeting后退出。
 
 #### 逆向text段感染
 
