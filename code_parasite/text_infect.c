@@ -3,6 +3,7 @@
  * the shellcode do thing but print a greeting in the terminal.
  * Usage: ./text_infect <host_file> 
 */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>

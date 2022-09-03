@@ -4468,13 +4468,15 @@ int main()
 
 实现上述代码寄生的代码如下：
 
-##### parasite_greeting
+##### text_infect
 
 ```c
-/* parasite_greeting.c 
+/* text_infect.c 
  * parasite a shellcode to the host.
- * Usage: ./parasite_greeting <host_file> 
+ * the shellcode do thing but print a greeting in the terminal.
+ * Usage: ./text_infect <host_file> 
 */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
