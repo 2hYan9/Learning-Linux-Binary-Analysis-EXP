@@ -4391,35 +4391,11 @@ ELF病毒的原理：
 - For each shdr who's section resides after the insertion Increase sh_offset by PAGE_SIZE
 - Patch the insertion code (parasite) to jump to the entry point (original) 
 
-其实这个方法的原理就是将寄生代码放到宿主程序运行时内存的text段填充的部分，这一步的工作很简单，只需要将寄生代码插入到text段的末尾即可，插入的过程是重写一个新的文件，在插入操作完成后用这个新的文件覆盖掉原来的文件。
-
 > 注意这里为什么需要将寄生代码填充到一个PAGE_SIZE的大小，这是因为在插入过程中需要保证每一个段的p_offset = p_vaddr MOD PAGESIZE，而插入寄生代码的过程中会影响到text段之后所有段的p_offset，所以可能会导致后面的段无法满足这个要求而出现错误。
 >
 > 所以这里的解决方法是将寄生代码填充到一个PAGE_SIZE的大小后再插入，那么后面的所有段依然能够满足上面的要求。
 
-在完成了插入之后，文件应该是下面这样的：
-
-[ELF Header] 
-
-[Program header table] 
-
-[Segment 1]	- The text segment of the host 
-
-[Parasite code]
-
-[Segment 2]	- The data segment of the host 
-
-[Section header table] 
-[Section 1] 
-. . .
-[Section n]
-
-
-为了能够在程序加载的时候将寄生代码也加载到内存中，这里需要将text段对应的程序头中的 p_filesz 和p_memsz 扩大到对应的大小。
-
-为了让寄生代码不被轻易发现，所以需要修改文件头节头表偏移，因为节头表总是位于文件末尾，所以这个节头表偏移量相当于文件的大小；并且在程序头表和节头表中的每个条目的文件偏移量(p_offset, sh_offset)更新为正确的偏移量；此外还需要将text段的最后一个节对应的节头表条目中的sh_size进行扩大，这样使得寄生代码恰好位于text段的最后一个节中。
-
-最后，为了能够让宿主程序执行寄生代码，这里使用的方法是直接将宿主程序的程序入口点修改为寄生代码插入的地址，即phdr[text].p_vaddr + phdr[text].p_memsz，同时为了能够让宿主程序也正常执行（这样不容易被发现），寄生代码在执行完成后还需要跳转到宿主程序的原来的程序入口点，将控制移交给宿主程序。
+其实这个方法的原理就是将寄生代码放到宿主程序运行时内存的text段填充的部分，这一步的工作很简单，只需要将寄生代码插入到text段的末尾即可，插入的过程是重写一个新的文件，在插入操作完成后用这个新的文件覆盖掉原来的文件。
 
 **#2**. 如何让插入到宿主程序的寄生代码顺利执行
 
@@ -4442,11 +4418,38 @@ char str_1[] = {'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!', '\0'
 
 #### text段感染
 
-下面介绍一个text段感染的实例。
+下面将通过实验复现前面介绍的代码寄生的方法。
+
+在完成了代码寄生之后，文件应该是下面这样的：
+
+[ELF Header] 
+
+[Program header table] 
+
+[Segment 1]	- The text segment of the host 
+
+[Parasite code]
+
+[Segment 2]	- The data segment of the host 
+
+[Section header table]
+
+为了能够在程序加载的时候将寄生代码也加载到内存中，这里需要将text段对应的程序头中的 p_filesz 和p_memsz 字段增加寄生代码的大小。
+
+为了让寄生代码不被轻易发现，所以需要修改文件头节头表偏移，因为节头表总是位于文件末尾，所以这个节头表偏移量相当于文件的大小；
+
+并且在程序头表和节头表中的每个条目的文件偏移量(p_offset, sh_offset)更新为正确的偏移量（因为本人的实验环境中text段对应的文件区域也是有填充的，所以这一步可以省略）；
+
+此外还需要将text段的最后一个节对应的节头表条目中的sh_size进行扩大，这样使得寄生代码恰好位于text段的最后一个节中。
+
+最后，为了能够让宿主程序执行寄生代码，这里使用的方法是直接将宿主程序的程序入口点修改为寄生代码插入的地址，即phdr[text].p_vaddr + phdr[text].p_memsz，同时为了能够让宿主程序也正常执行（这样不容易被发现），寄生代码在执行完成后还需要跳转到宿主程序的原来的程序入口点，将控制移交给宿主程序。如下：
+
+```
+movl %rax, $origin_entry
+jmp *%rax
+```
 
 在本人的实验环境中，二进制文件的text段和内存镜像都是有填充的，所以进行代码寄生的方法和前面所介绍的代码注入的方法一样，当然个人还是觉得代码注入更加有难度一些。
-
-也就是修改二进制文件的内容，在文件text段的填充区域写入寄生的代码，然后将二进制文件的程序入口点修改为寄生代码的位置，也就是原来的text段的结束地址。这里的寄生代码同样只是打印一句greeting，然后跳转到二进制文件原来的程序入口点的位置，去执行这个文件之文件本来该执行的代码。
 
 这里实验所使用的宿主程序的代码如下：
 
@@ -4468,7 +4471,7 @@ int main()
 
 实现上述代码寄生的代码如下：
 
-##### text_infect
+##### Text infect
 
 ```c
 /* text_infect.c 
@@ -4659,10 +4662,36 @@ int main(int argc, char *argv[])
 
 ![parasite_greeting](./image/parasite_greeting.png)
 
-如何让宿主程序在执行完寄生代码后继续执行其原来的代码依然是一个待解决的问题。
+如何让宿主程序在执行完寄生代码后继续执行其原来的代码依然是一个待解决的问题。但是可以知道的是，在文件的text段填充区域可以用来存放一段恶意代码，可以让宿主程序顺利执行这段恶意代码。
 
 目前的计划是先将这本书中的内容看一遍，然后再着手解决这个问题，所以后面的代码寄生以及代码注入的实验中，写入的代码都只是打印一句greeting后退出。
 
 #### 逆向text段感染
 
 这种感染方法是由 Silvo 提出的，这种方法的原理是对text段进行逆向扩展。
+
+如果能够对text段进行逆向扩展，那么就可以对其进行text段感染，这种方法与前面的text段感染(有些资料里将其成为填充感染，padding infection)不同的是，通过逆向text段感染后的宿主文件的程序入口点依然是指向.text节的，这样相比于前面介绍的感染方法更加不容易被发现。
+
+在完成了代码寄生后，宿主程序对应的二进制文件应该是下面这样的：
+
+[ELF Header] 
+
+[Program header table] 
+
+[Parasite code] - (.text section)
+
+[Segment 1]	- The text segment of the host 
+
+[Segment 2]	- The data segment of the host 
+
+[Section header table]
+
+除了感染点与text段填充感染不同，其他的原理基本都一样。当然，最后需要将text段的第一个节(.text)对应的节头表的sh_size字段进行放大。
+
+代码实现如下：
+
+##### Reverse text infect
+
+```c
+
+```
