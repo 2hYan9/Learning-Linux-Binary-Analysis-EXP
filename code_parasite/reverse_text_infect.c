@@ -1,5 +1,5 @@
 /* reverse_text_infect.c 
- * parasite a shellcode to the host.
+ * parasite a shellcode to the host's entry point.
  * the shellcode do nothing but print a greeting in the terminal.
  * Usage: ./reverse_text_infect <host_file> 
 */
