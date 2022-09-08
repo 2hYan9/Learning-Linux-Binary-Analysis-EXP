@@ -4908,6 +4908,21 @@ int main(int argc, char *argv[])
 
 当然，既然能够将PT_NOTE改写为PT_LOAD，那么也就可以添加一个新的PT_LOAD段，用于存放寄生代码，并且加载到内存执行。
 
+如果选择添加一个新的可加载段来进行代码寄生的话，那么完成代码寄生后的宿主文件应该如下图所示：
+
+[ELF Header] 
+
+[Program header table] 
+
+[Segment 1]	- The text segment of the host 
+
+[Evil_loadable Segment] - code parasite here
+
+[Segment 2]	- The data segment of the host 
+
+[Section header table]
+
+这种感染方法的实现过程如下：
 
 
 ### 感染控制流
