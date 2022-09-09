@@ -4932,7 +4932,7 @@ int main(int argc, char *argv[])
 
 代码实现如下：
 
-##### new_load_infect
+##### New loadable segment infect
 
 ```c
 /* new_load_infect.c 
@@ -5195,7 +5195,15 @@ int main(int argc, char *argv[])
 > 遇到过的错误：
 > write: BAD ADDRESS. 这个问题有两个可能的原因：一是传递给write()系统调用的地址不是一个有效的地址，而是传递write()系统调用的长度参数可能是一个负数。
 
-通过readelf查看被感染的宿主文件，没有发现异常的点，所以这个问题暂时还没得到一个有效的解决。
+通过readelf查看被感染的宿主文件，没有发现异常的点，如下：
+
+![new_segment_phdr](./image/new_segment_phdr.png)
+
+而strace分析的结果如下：
+
+![new_segment_strace](./image/new_segment_strace.png)
+
+这个问题暂时还没得到一个有效的解决，目前猜测可能是在程序加载过程中出现的错误。
 
 ### 感染控制流
 
