@@ -1213,6 +1213,36 @@ Usage: `strace <program>`
 
 当然，strace能够支持很多中选项，具体可以参考手册"strace(1)"。
 
+实验中所追踪的程序源码如下：
+```c
+/* nostd.c */
+/* Compile: gcc -nostdlib nostd.c -o nostd */
+
+int bss;
+
+int data = 1;
+
+int _start()
+{
+    int buf = 0;
+    int fd = 0;
+    long len = 4;
+    __asm__ volatile(
+        "mov %0, %%edi\n"
+        "mov %1, %%rsi\n"
+        "mov %2, %%rdx\n"
+        "mov $0, %%rax\n"
+        "syscall\n"
+        "mov $0, %%rdi\n"
+        "mov $60, %%rax\n"
+        "syscall\n"
+        : 
+        : "g"(fd), "g"(&buf), "g"(len)
+    );
+    return 0;
+}
+```
+
 下图是使用strace跟踪一个完全没有使用库函数并且没有开启地址无关话的程序的结果：
 
 ![strace_nostd_nopie](./image/strace_nostd_nopie.png)
@@ -1439,6 +1469,20 @@ FS和GS没有特定的意义，在不同的操作系统上，有着不同的用�
 ### 有标准库函数
 
 前面分析的两个例子中都排除了程序调用标准库函数的情况，而现在，将会对程序调用了标准库函数的情况进行分析，了解程序在进行动态链接之前都做了什么。这部分内容主要设计动态连接器加载共享目标的过程。
+
+实验中所追踪的程序源码如下：
+
+```c
+#include <stdio.h>
+
+int a;
+
+int main()
+{
+    char c = getchar();
+    return 0;
+}
+```
 
 这里用于实验的被追踪程序只是简单的调用getchar()函数以供我们在程序运行时进行分析，关闭地址随机化，使用strace追踪的结果如下：
 
