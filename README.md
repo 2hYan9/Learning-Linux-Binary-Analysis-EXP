@@ -1451,13 +1451,13 @@ FS和GS没有特定的意义，在不同的操作系统上，有着不同的用�
 可以看多这里又多出来一些别的系统调用，这里将这些系统调用单独拎出来进行分析：
 
 ```c
-execve("./stdlib", ["./stdlib"], 0x7ffd13096860 /* 49 vars */) = 0
-brk(NULL)                               = 0x1377000
-arch_prctl(0x3001 /* ARCH_??? */, 0x7ffd32950820) = -1 EINVAL (Invalid argument)
+execve("./stdlib", ["./stdlib"], 0x7fffb0455720 /* 49 vars */) = 0
+brk(NULL)                               = 0x992000
+arch_prctl(0x3001 /* ARCH_??? */, 0x7fff8ae37c30) = -1 EINVAL (Invalid argument)
 access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory)
 openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
 fstat(3, {st_mode=S_IFREG|0644, st_size=65084, ...}) = 0
-mmap(NULL, 65084, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7fde279e9000
+mmap(NULL, 65084, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7f7a13282000
 close(3)                                = 0
 openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
 read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\300A\2\0\0\0\0\0"..., 832) = 832
@@ -1465,24 +1465,24 @@ pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 7
 pread64(3, "\4\0\0\0\20\0\0\0\5\0\0\0GNU\0\2\0\0\300\4\0\0\0\3\0\0\0\0\0\0\0", 32, 848) = 32
 pread64(3, "\4\0\0\0\24\0\0\0\3\0\0\0GNU\0\30x\346\264ur\f|Q\226\236i\253-'o"..., 68, 880) = 68
 fstat(3, {st_mode=S_IFREG|0755, st_size=2029592, ...}) = 0
-mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7fde279e7000
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f7a13280000
 pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784
 pread64(3, "\4\0\0\0\20\0\0\0\5\0\0\0GNU\0\2\0\0\300\4\0\0\0\3\0\0\0\0\0\0\0", 32, 848) = 32
 pread64(3, "\4\0\0\0\24\0\0\0\3\0\0\0GNU\0\30x\346\264ur\f|Q\226\236i\253-'o"..., 68, 880) = 68
-mmap(NULL, 2037344, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7fde277f5000
-mmap(0x7fde27817000, 1540096, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x22000) = 0x7fde27817000
-mmap(0x7fde2798f000, 319488, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x19a000) = 0x7fde2798f000
-mmap(0x7fde279dd000, 24576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1e7000) = 0x7fde279dd000
-mmap(0x7fde279e3000, 13920, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x7fde279e3000
+mmap(NULL, 2037344, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7f7a1308e000
+mmap(0x7f7a130b0000, 1540096, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x22000) = 0x7f7a130b0000
+mmap(0x7f7a13228000, 319488, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x19a000) = 0x7f7a13228000
+mmap(0x7f7a13276000, 24576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1e7000) = 0x7f7a13276000
+mmap(0x7f7a1327c000, 13920, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x7f7a1327c000
 close(3)                                = 0
-arch_prctl(ARCH_SET_FS, 0x7fde279e8540) = 0
-mprotect(0x7fde279dd000, 16384, PROT_READ) = 0
+arch_prctl(ARCH_SET_FS, 0x7f7a13281540) = 0
+mprotect(0x7f7a13276000, 16384, PROT_READ) = 0
 mprotect(0x403000, 4096, PROT_READ)     = 0
-mprotect(0x7fde27a26000, 4096, PROT_READ) = 0
-munmap(0x7fde279e9000, 65084)           = 0
+mprotect(0x7f7a132bf000, 4096, PROT_READ) = 0
+munmap(0x7f7a13282000, 65084)           = 0
 fstat(0, {st_mode=S_IFCHR|0620, st_rdev=makedev(0x88, 0), ...}) = 0
-brk(NULL)                               = 0x1377000
-brk(0x1398000)                          = 0x1398000
+brk(NULL)                               = 0x992000
+brk(0x9b3000)                           = 0x9b3000
 read(0, 
 "\n", 1024)                     = 1
 exit_group(0)                           = ?
