@@ -1154,7 +1154,7 @@ GOT的前三个条目是保留为固定的参数：
 
 这里将会使用strace工具分析Linux中程序加载的过程，试图分析出进程在执行程序员所写的代码之前会调用的系统调用，以及这些系统调用的含义。
 
-当然，这里只是从系统调用的层面讨论程序加载的过程。
+当然，这里只是从系统调用的层面讨论程序加载的过程。这部分的内容主要是介绍如何使用strace，以及如何查看目标进程的内存镜像，比较重要的内容是动态链接器加载共享目标的过程。
 
 ### 进程创建
 
@@ -1311,7 +1311,7 @@ strace输出的每一行都是以"="分割为两个部分，等号左边表示�
 brk(NULL)                               = 0x560a33c61000
 /* ignore this system call */
 arch_prctl(0x3001 /* ARCH_??? */, 0x7ffd10578a20) = -1 EINVAL (Invalid argument)
-/* prepare for preload, but there didn't require for preload */
+/* check for preload, but there didn't require for preload */
 access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory)
 /* allocate memory for FS register */
 mmap(NULL, 8192 /*0x2000*/, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f25771e4000
@@ -1396,7 +1396,7 @@ ELF文件的.interp 节中包含文件指定的动态链接器的路径，从而
 - --inhibit-cache：忽略 /etc/ld.so.cache 文件
 - --inhibit-rpath list：忽略由参数 *list* 指定的共享目标RPATH和RUNPATH的信息
 
-除了这些选项，各种环境变量也会影响动态链接器加载共享目标的过程，而这里对预加载相关的环境变量进行讨论：
+除了这些选项，各种环境变量也会影响动态链接器加载共享目标的过程，而这里对预加载相关的环境变量进行介绍：
 
 LD_BIND_NOW：这个环境变量包含了一个追加的、用户指定的ELF共享目标文件的列表，这个列表中的共享目标文件会在其他所有共享目标文件之前加载，==所以通过这个特性，可以重写其他共享目标文件中的函数==。
 
@@ -1440,6 +1440,8 @@ int syscall(SYS_arch_prctl, int code, unsigned long addr);
 int syscall(SYS_arch_prctl, int code, unsigned long *addr);
 ```
 
+注意，glibc中并没有对arch_prctl()进行封装，所以需要使用syscall()函数进行调用。
+
 这个系统调用用于设置特定于体系结构的进程或线程状态，*code* 参数用于指定相应的子函数，或者可以理解对系统调用要执行的操作，并将 *addr* 参数传递给该系统调用，对于 "set" 操作，参数 *addr* 会被解释为unsigned long类型；对于"get"操作，参数 *addr* 会被解释为unsigned long *类型。
 
 *code* 参数可选为"ARCH_SET_CPUID", "ARCH_GET_CPUID", "ARCH_SET_FS", "ARCH_GET_FS", "ARCH_SET_GS", "ARCH_GET_GS"。这里的各种操作的具体含义不做详细介绍，具体可以参考手册。
@@ -1456,7 +1458,7 @@ int syscall(SYS_arch_prctl, int code, unsigned long *addr);
 
 CS(Code segment), DS(Data segment), SS(Stack segment), ES(Extra segment), FS, GS
 
-FS和GS没有特定的意义，在不同的操作系统上，有着不同的用途，这些用途都是处理器指定的。**这里的系统调用以及FS寄存器可能都与Intel的CET技术相关，这在后面的实验中可能会用到。**此外，栈保护机制的canary也是依赖FS所指向的段中的内容。
+FS和GS没有特定的意义，在不同的操作系统上，有着不同的用途，这些用途都是处理器指定的。**这里的系统调用以及FS寄存器可能都与Intel的CET技术相关，这在后面的实验中可能会用到。**此外，栈保护机制的canary也是依赖FS所指向的段中的内容，对于开启了栈保护的二进制文件，可以看到每个函数的开头和结尾都插入了一条与FS寄存器相关的指令。
 
 而在Linux系统下，FS指向的区域为TLS(Thread Local Storage)，GS指向的区域为PDA(Processor Data Area)。
 
@@ -1528,6 +1530,7 @@ mmap(0x7f7a1327c000, 13920, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANON
 close(3)                                = 0
 /* set FS register */
 arch_prctl(ARCH_SET_FS, 0x7f7a13281540) = 0
+/* set access permission of some area */
 mprotect(0x7f7a13276000, 16384, PROT_READ) = 0
 mprotect(0x403000, 4096, PROT_READ)     = 0
 mprotect(0x7f7a132bf000, 4096, PROT_READ) = 0
@@ -6091,6 +6094,12 @@ _start() 函数会首先调用 _libc_start_main_impl() 函数，然后 _libc_sta
 这里将会讨论几个远程代码注入技术，也就是将代码注入到别的进程中的方法。
 
 #### 共享库注入
+
+共享库注入是将一个共享库（无论恶意与否）注入到已存在的进程地址空间中，注入共享库后，需要通过PLT/GOT重定向或者函数蹦床等控制流劫持技术将目标进程的控制转移到注入的共享库中。
+
+所以需要解决的问题就是如何将共享库装载到内存中。
+
+
 
 #### text段代码注入
 

