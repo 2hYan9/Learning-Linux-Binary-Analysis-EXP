@@ -117,7 +117,7 @@ int pid_read(pid_t pid, const void *dst, const void *src, size_t len)
 {
     int times = len / sizeof(long);
     void *s = (void *)src;
-    void *d = dst;
+    void *d = (void *)dst;
     int i;
     for(i = 0; i < times; i++)
     {
@@ -140,7 +140,7 @@ int pid_write(pid_t pid, const void *dst, const void *src, size_t len)
 {
     int times = len / sizeof(long);
     void *s = (void *)src;
-    void *d = dst;
+    void *d = (void *)dst;
     int i;
     for(i = 0; i < times; i++)
     {
@@ -334,6 +334,11 @@ int main(int argc, char *argv[])
             exit(EXIT_FAILURE);
         }
         printf("return value of shellcode: 0x%llx\n", h.pt_reg.rax);
+        if(h.pt_reg.rax != BASE_ADDRESS)
+        {
+            perror("mmap");
+            exit(-1);
+        }
     }
     
     int fd;

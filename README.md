@@ -4369,32 +4369,6 @@ int main()
 
 ==需要注意的是==，在上面的例子中，在注入shellcode之前将那块区域的内容先保存了下来，这样其实是没必要的，因为我们是在text段的填充区域进行代码注入的，可以发现这块区域的内容全为0。而真正需要这样做的场景是，在目标进程text段的任意位置进行代码注入时，可以先保存注入位置的代码，然后让目标进程执行完shellcode后恢复原来的代码，继续执行原来的代码。
 
-##### Code_inject
-
-在下面的例子中，我们要求shellcode完成一些更复杂的任务：使用malloc()在指定区域分配一个具有执行权限的内存空间，然后将另一个文件中的代码加载到这个空间，然后将目标进程的执行流跳转到这个空间上去执行，这就是所谓目标进程。
-
-这里的代码实现出了一点问题，因为在附加到目标进程时，目标进程正在执行sleep()系统调用，此时目标进程的PC位于共享库中。
-
-当我们注入shellcode时，将PC跳转到text段填充区域进行执行，并且shellcode中最后一条指令是一条"int3"指令，于是目标进程在执行完shellcode后会被中断，并且将控制返回到code_inject程序中，此时，目标进程已经成功执行了shellcode，开辟了一块匿名内存空间。
-
-然后code_inject再将payload加载到这块匿名内存空间上准备执行。
-
-加载完成后，将目标进程的PC设置为payload的程序入口点，并让目标进程执行，然而，此时的目标进程继续执行会出现segmentation fault。
-
-如下面的示意图所示：
-
-![code_injection_fault](./image/code_injection_fault.png)
-
-其中带数字的线表示程序的控制流。其中以PC为起始点的控制转移路线是指追踪host程序的code_inect程序修改host的PC所进行的控制转移，而第2次控制转移是host程序被shellcode中的"int3"指令中断后将控制返回到code_inject程序。
-
-在最后一步的控制流转移的时候，如果将host的控制转移到匿名内存空间，将会出现segmentation fault。事实上，转移到除原来的PC位置以外的任何位置都会造成一个segmentation fault；而如果将控制转移到host原来的位置，并且恢复host的%rsp和%rbp寄存器后，程序能够回到原来的位置继续执行。
-
-**也就是说，在修改宿主程序的PC以操控其控制流时，第一次修改没有问题，但是第二次修改只能回到其原来的位置进行执行，否则将会出现段错误**。
-
-**这个问题可能与Intel的CET技术相关，目前的计划是先把这本书的内容过一遍，然后再着手解决这个问题。**
-
-这个问题暂时还没有得到一个有效的解决方法。*这个问题暂时先留着，等以后有机会再解决*。
-
 ### Ptrace反调试技巧
 
 ptrace系统调用有时候也可用来进行反调试，通常情况，黑客不想让自己的程序被轻易调试时，会采用特定的反调试技术。
@@ -4411,7 +4385,7 @@ if(ptrace(PTRACE_TRACEME, 0) < 0)
 }
 ```
 
-让上面这段代码一直执行该，只有在程序被追踪的时候才会退出。（这就涉及到了多线程编程）
+让上面这段代码一直执行，只有在程序被追踪的时候才会退出。（这就涉及到了多线程编程）
 
 但是这种基于ptrace系统调用的反调试方法是可以绕过的，比如使用LD_PRELOAD环境变量，来诱骗程序加载一个假的ptrace系统调用。这个假的ptrace系统调用什么都不做，只返回0，并且对调试器不会产生什么影响。
 
@@ -6093,7 +6067,7 @@ _start() 函数会首先调用 _libc_start_main_impl() 函数，然后 _libc_sta
 
 这里将会讨论几个远程代码注入技术，也就是将代码注入到别的进程中的方法。
 
-#### 共享库注入
+#### 共享库注入*
 
 共享库注入是将一个共享库（无论恶意与否）注入到已存在的进程地址空间中，注入共享库后，需要通过PLT/GOT重定向或者函数蹦床等控制流劫持技术将目标进程的控制转移到注入的共享库中。
 
@@ -6142,17 +6116,160 @@ void *dlmopen(Lmid_t lmid, const char *filename, int flags);
 
 程序可以通过dlopen()函数凭空加载一个共享库，实际上是调用了动态链接器来进行所有的重定位操作。
 
-但是还有一个问题就是，大多数进程中是没有可用的dlopen()函数的，但是这个问题也不难解决，在libc.so.6中能够找到dlopen()函数的定义，因此可以对这个函数进行远程解析。
+在使用 dlopen() 进行共享库注入之前，有必要了解一下应该如何使用 dlopen()，下面的代码用以演示如何使用 dlopen() 加载一个共享库：
+
+```c
+/* host.c */
+/* gcc -no-pie host.c -o host */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <dlfcn.h>
+
+void call_func(void (*f)(void))
+{
+    (*f)();
+}
+
+int main()
+{
+    void *handle = dlopen("/tmp/payload.so", RTLD_NOW);
+    if(handle == NULL)
+    {
+        fprintf(stderr, "%s\n", dlerror());
+        exit(EXIT_FAILURE);
+    }
+    char *error;
+    void *start_addr = dlsym(handle, "_start");
+    if((error = dlerror()) != NULL)
+    {
+        fprintf(stderr, "%s\n", error);
+        exit(EXIT_FAILURE);
+    }
+     
+    printf("_start located in: 0x%lx\n", (uint64_t)start_addr);
+    call_func(start_addr);
+    exit(0);
+}
+```
+
+用下面的代码生成一个共享库：
+```c
+// playload.c
+// compile: gcc -pie -fpic -nostdlib payload.c -o payload
+
+static inline volatile long 
+_write(long, char *, unsigned long) 
+__attribute__((aligned(8), __always_inline__));
+
+static inline volatile void 
+_exit(long)
+__attribute__((aligned(8), __always_inline__));
+
+
+
+long _write(long fd, char *buf, unsigned long len)
+{
+    long ret;
+    __asm__ volatile(
+        "mov %1, %%rdi\n"
+        "mov %2, %%rsi\n"
+        "mov %3, %%rdx\n"
+        "mov $1, %%rax\n"
+        "syscall"
+        "\n"
+        "mov %%rax, %0\n"
+        : "=r"(ret)
+        : "g"(fd), "g"(buf), "g"(len)
+    );
+    return ret;
+}
+
+void _exit(long status)
+{
+    __asm__ volatile(
+        "mov %0, %%rdi\n"
+        "mov $60, %%rax\n"
+        "syscall"
+        :
+        : "r"(status)
+    );
+}
+
+_start()
+{
+    char str[] = {'I','\'', 'm', ' ', 't',
+                    'h', 'e', ' ', 'p', 'a', 'y', 'l', 'o', 
+                    'a', 'd',' ', 'w', 'h', 'o', ' ', 'h', 'a', 's', ' ',
+                    'h', 'i', 'j', 'a', 'c', 'k', 'e', 'd', ' ',
+                    'y', 'o', 'u', 'r', ' ', 'p', 'r', 'o', 'c', 'e', 's', 's', '!', '\n'};
+    _write(1, str, 48);
+    _exit(0);
+}
+```
+
+为了使其生成共享库，可以使用
+
+`gcc -shared -nostdlib payload.c -o payload.so`
+
+进行编译，得到的 payload.so 文件就是一个共享库类型的文件。
+
+程序的执行结果如下：
+
+![dlopen_example](./image/dlopen_example.png)
+
+可以看到能够成功地在运行时加载一个共享库，并且顺利的解析到了共享库中函数地址，然后通过函数指针执行了该函数。
+
+但是还有一个问题就是，大多数进程中是没有可用的dlopen()函数的，但是这个问题也不难解决，在libc.so.6中能够找到dlopen()函数的定义，因此可以对这个函数进行远程解析：
 
 首先定位到libc.so.6的基地址，注意到共享目标和可执行文件的加载方式都是一样的，第一个段中包含文件头和程序头表；根据程序头表中的信息，定位到 PT_DYNAMIC 段的位置；然后在DYNAMIC段中找到 .dynsym 和 .dynstr 节的地址，这里需要注意的问题是，DYNAMIC 段中并没有给出 .dynsym 的大小，但是注意到 .dynsym 和 .dynstr 是紧挨着的，所以 .dynsym 的大小就是 .dynstr 的地址减去 .dynsym 的地址；有了这两个节的地址后便可以得到 dlopen() 函数的地址，从而实现调用。
 
 #### 可执行文件注入
 
-dlopen()系统调用也可以用于将PIE类型的可执行文件加载到进程中，所以可以注入ET_EXEC类型的可执行文件。但是需要注意的是，使用这样的方法注入一些比较复杂的可执行文件时，其可靠性会降低。
+dlopen()系统调用也可以用于将PIE类型的可执行文件加载到进程中，所以可以注入ET_EXEC类型的可执行文件。
+
+> 也就是说dlopen() 无法用以动态加载一些位置无关的可执行文件：
+> 
+> ![position_independent_exec](./image/position_independent_exec.png)
+> 
+> 可以看到，上面的可执行文件类型虽然是 ET_DYN，但是是一个无关的可执行文件，如果使用dlopen() 去加载这样的可执行文件，那么将会出错：
+> ![dlopen_failure](./image/dlopen_failure.png)
+> 
+> dlerror() 提示："cannot dynamically load position-independent executable"。
+
+但是需要注意的是，使用这样的方法注入一些比较复杂的可执行文件时，其可靠性会降低。
 
 #### text段代码注入
 
 这种技术在之前介绍进程追踪时就已经提到过，不过这里补充一点是，注入代码的地址其实可以使text段的任意位置，只要在注入的代码执行完成后立即回复原来的代码即可。除此之外，这个技术的使用场景并不是很多。
+
+##### Code_inject
+
+在下面的例子中，我们要求shellcode完成一些更复杂的任务：使用malloc()在指定区域分配一个具有执行权限的内存空间，然后将另一个文件中的代码加载到这个空间，然后将目标进程的执行流跳转到这个空间上去执行，这就是所谓目标进程。
+
+这里的代码实现出了一点问题，因为在附加到目标进程时，目标进程正在执行sleep()系统调用，此时目标进程的PC位于共享库中。
+
+当我们注入shellcode时，将PC跳转到text段填充区域进行执行，并且shellcode中最后一条指令是一条"int3"指令，于是目标进程在执行完shellcode后会被中断，并且将控制返回到code_inject程序中，此时，目标进程已经成功执行了shellcode，开辟了一块匿名内存空间。
+
+然后code_inject再将payload加载到这块匿名内存空间上准备执行。
+
+加载完成后，将目标进程的PC设置为payload的程序入口点，并让目标进程执行，然而，此时的目标进程继续执行会出现segmentation fault。
+
+如下面的示意图所示：
+
+![code_injection_fault](./image/code_injection_fault.png)
+
+其中带数字的线表示程序的控制流。其中以PC为起始点的控制转移路线是指追踪host程序的code_inect程序修改host的PC所进行的控制转移，而第2次控制转移是host程序被shellcode中的"int3"指令中断后将控制返回到code_inject程序。
+
+在最后一步的控制流转移的时候，如果将host的控制转移到匿名内存空间，将会出现segmentation fault。事实上，转移到除原来的PC位置以外的任何位置都会造成一个segmentation fault；而如果将控制转移到host原来的位置，并且恢复host的%rsp和%rbp寄存器后，程序能够回到原来的位置继续执行。
+
+**也就是说，在修改宿主程序的PC以操控其控制流时，第一次修改没有问题，但是第二次修改只能回到其原来的位置进行执行，否则将会出现段错误**。
+
+**这个问题可能与Intel的CET技术相关，目前的计划是先把这本书的内容过一遍，然后再着手解决这个问题。**
+
+这个问题暂时还没有得到一个有效的解决方法。*这个问题暂时先留着，等以后有机会再解决*。
 
 ## 0x07 Linux 二进制保护
 
