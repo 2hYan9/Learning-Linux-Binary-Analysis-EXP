@@ -15,10 +15,7 @@ void* call_func(void *(*f)(char *, int), char *str, int flags)
 
 int main()
 {
-    
     printf("Hello World!\n");
-    uint64_t dlopen_addr = (uint64_t)dlopen;
-    printf("dlopen at 0x%lx\n", dlopen_addr);
     printf("Sleep for 20 seconds ...\n");
     
     sleep(20);
