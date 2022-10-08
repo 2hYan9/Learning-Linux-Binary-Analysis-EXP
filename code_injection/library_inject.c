@@ -18,9 +18,6 @@
 #include <sys/errno.h>
 #include <dlfcn.h>
 
-/* the offset of int3 in shellcode */
-#define INT3_PATCH_OFFSET 4
-
 typedef struct _handle_t
 {
     /* pid of target process */
@@ -52,30 +49,46 @@ typedef struct _handle_t
 }handle_t;
 
 int dump_process(handle_t *);
-void injected_code(uint64_t/*, uint64_t*/);
+static volatile void injected_code(uint64_t);
 int dump_libc(handle_t *);
 int pid_read(pid_t, const void *, const void *, size_t);
 int pid_write(pid_t, const void *, const void *, size_t);
 uint64_t look_up_libcsymbol(handle_t, const char *);
 
-void injected_code(uint64_t dlopen_addr /*,uint64_t int3_addr*/)
+static volatile void injected_code(uint64_t dlopen_addr)
 { 
-    char library_name[] = {'/', 't', 'm', 'p', '/', 'p', 'a', 'y', 'l', 'o', 'a', 'd', '.', 's', 'o', '\0'}; 
-    uint64_t int3_addr = 0x401281;
-    int flags = 2;
-    int fd = 1;
-    char str[] = {'[', 'I', '\'', 'm', ' ', 'i', 'n', ' ', 'h', 'e', 'r', 'e', ']','\n', '\0'};
-    long len = 15;
     /*
+    char library_name[] = {'/', 't', 'm', 'p', '/', 'p', 'a', 'y', 'l', 'o', 'a', 'd', '.', 's', 'o', '\0'}; 
+    int flags = 2;
     __asm__ volatile(
         "mov %0, %%rdi\n"
         "mov %1, %%esi\n"
-        "push %2\n"
-        "jmp *%3\n"
+        "mov %2, %%rbx\n"
+        "call *%%rbx\n"
+        "int3\n"
         :
-        : "g"(library_name), "g"(flags), "g"(int3_addr), "g"(dlopen_addr)
+        : "g"(library_name), "g"(flags), "g"(dlopen_addr)
     );
     */
+    
+
+    
+    int fd = 1;
+    char str[] = {'[', 'I', '\'', 'm', ' ', 'i', 'n', ' ', 'h', 'e', 'r', 'e', ']','\n', '\0'};
+    long len = 15;    
+    
+    __asm__ volatile(
+        "mov %0, %%edi\n"
+        "mov %1, %%rsi\n"
+        "mov %2, %%rdx\n"
+        "mov %3, %%rbx\n"
+        "call *%%rbx\n"
+        "int3\n"
+        :
+        : "g"(fd), "g"(str), "g"(len), "g"(dlopen_addr)
+    );
+    
+    /*
     __asm__ volatile(
         "mov %0, %%edi\n"
         "mov %1, %%rsi\n"
@@ -86,7 +99,7 @@ void injected_code(uint64_t dlopen_addr /*,uint64_t int3_addr*/)
         : 
         : "g"(fd), "g"(str), "g"(len)
     );
-    
+    */
 }
 
 int dump_process(handle_t *h)
@@ -303,7 +316,7 @@ int pid_write(pid_t pid, const void *dst, const void *src, size_t len)
 unsigned long f1 = (uint64_t)injected_code;
 unsigned long f2 = (uint64_t)dump_process;
 
-uint8_t *create_shellcode(void (*fn)(), size_t len)
+uint8_t *create_shellcode(void (*fn)(uint64_t), size_t len)
 {
     int i;
     uint8_t *shellcode = (uint8_t *)malloc(len);
@@ -362,12 +375,12 @@ int main(int argc, char *argv[])
     }
 
     printf("Then, remote resolve the dynamic symbol...\n");
-    if((h.dlopen_addr = look_up_libcsymbol(h, "dlopen")) == 0)
+    if((h.dlopen_addr = look_up_libcsymbol(h, "write")) == 0)
     {
         printf("something went wrong with dlopen resolution.\n");
         exit(-1);
     }
-    if((h.dlsym_addr = look_up_libcsymbol(h, "perror")) == 0)
+    if((h.dlsym_addr = look_up_libcsymbol(h, "dlsym")) == 0)
     {
         printf("something went wrong with dlerror resolution.\n");
         exit(-1);
@@ -387,14 +400,13 @@ int main(int argc, char *argv[])
     
     printf("Going to inject shellcode to the text padding area...\n");
     printf("\t[+] inject to 0x%lx\n", inject_addr);
-    uint64_t int3_addr = inject_addr + shell_size - INT3_PATCH_OFFSET;
     
-    printf("\t[+] address of int3 is: 0x%lx\n", int3_addr);
     if(ptrace(PTRACE_GETREGS, h.pid, NULL, &h.pt_reg) < 0)
     {
         fprintf(stderr, "Failed to get the registers of target process %d: %s\n", h.pid, strerror(errno));
         exit(EXIT_FAILURE);
     }
+
     uint64_t old_rip = h.pt_reg.rip;
     uint64_t old_rsp = h.pt_reg.rsp;
     uint64_t old_rbp = h.pt_reg.rbp;
@@ -407,7 +419,6 @@ int main(int argc, char *argv[])
 
     h.pt_reg.rip = inject_addr;
     h.pt_reg.rdi = h.dlopen_addr;
-    // h.pt_reg.rsi = int3_addr;
     // h.pt_reg.rdx = h.dlerror_addr;
 
     if(ptrace(PTRACE_SETREGS, h.pid, NULL, &h.pt_reg) < 0)
@@ -415,6 +426,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Failed to set the registers of target process %d: %s\n", h.pid, strerror(errno));
         exit(EXIT_FAILURE);
     }
+
     if(ptrace(PTRACE_CONT, h.pid, NULL, NULL) < 0)
     {
         fprintf(stderr, "Failed to restart the target process %d: %s\n", h.pid, strerror(errno));
