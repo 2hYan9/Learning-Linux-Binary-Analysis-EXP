@@ -15,6 +15,7 @@ void* call_func(void *(*f)(char *, int), char *str, int flags)
 
 int main()
 {
+    const char * payloadso = "/tmp/payload.so";
     printf("Hello World!\n");
     printf("Sleep for 20 seconds ...\n");
     
