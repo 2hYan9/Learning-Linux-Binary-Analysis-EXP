@@ -13,18 +13,19 @@ void* call_func(void *(*f)(char *, int), char *str, int flags)
     return (*f)(str, flags);
 }
 
+
+
 int main()
 {
-    const char * payloadso = "/tmp/payload.so";
     printf("Hello World!\n");
     printf("Sleep for 20 seconds ...\n");
     
     sleep(20);
     printf("Sleep over.\n");
 
-    /*    
+    /*
+    uint64_t dlopen_addr = (uint64_t)dlopen;
     char library_name[] = {'/', 't', 'm', 'p', '/', 'p', 'a', 'y', 'l', 'o', 'a', 'd', '.', 's', 'o', '\0'}; 
-    int flags = 0x2;
 
     __asm__ volatile(
         "mov %0, %%rdi\n"
@@ -32,11 +33,13 @@ int main()
         "mov %2, %%rbx\n"
         "call *%%rbx\n"
         :
-        : "g"(library_name), "g"(flags), "g"(dlopen_addr)
+        : "g"(library_name), "g"(RTLD_LAZY), "g"(dlopen_addr)
     );
     
     if(dlerror() != NULL) printf("%s\n", dlerror());
     
+
+
     printf("Press any key to continue...\n");
     getchar();
     */

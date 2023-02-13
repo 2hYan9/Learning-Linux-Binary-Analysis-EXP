@@ -57,49 +57,19 @@ uint64_t look_up_libcsymbol(handle_t, const char *);
 
 static volatile void injected_code(uint64_t dlopen_addr)
 { 
-    /*
+    
     char library_name[] = {'/', 't', 'm', 'p', '/', 'p', 'a', 'y', 'l', 'o', 'a', 'd', '.', 's', 'o', '\0'}; 
-    int flags = 2;
+    int flags = RTLD_LAZY;
     __asm__ volatile(
         "mov %0, %%rdi\n"
-        "mov %1, %%esi\n"
+        "mov %1, %%rsi\n"
         "mov %2, %%rbx\n"
         "call *%%rbx\n"
         "int3\n"
         :
         : "g"(library_name), "g"(flags), "g"(dlopen_addr)
     );
-    */
     
-
-    
-    int fd = 1;
-    char str[] = {'[', 'I', '\'', 'm', ' ', 'i', 'n', ' ', 'h', 'e', 'r', 'e', ']','\n', '\0'};
-    long len = 15;    
-    
-    __asm__ volatile(
-        "mov %0, %%edi\n"
-        "mov %1, %%rsi\n"
-        "mov %2, %%rdx\n"
-        "mov %3, %%rbx\n"
-        "call *%%rbx\n"
-        "int3\n"
-        :
-        : "g"(fd), "g"(str), "g"(len), "g"(dlopen_addr)
-    );
-    
-    /*
-    __asm__ volatile(
-        "mov %0, %%edi\n"
-        "mov %1, %%rsi\n"
-        "mov %2, %%rdx\n"
-        "mov $1, %%rax\n"
-        "syscall\n"
-        "int3\n"
-        : 
-        : "g"(fd), "g"(str), "g"(len)
-    );
-    */
 }
 
 int dump_process(handle_t *h)
@@ -375,7 +345,7 @@ int main(int argc, char *argv[])
     }
 
     printf("Then, remote resolve the dynamic symbol...\n");
-    if((h.dlopen_addr = look_up_libcsymbol(h, "write")) == 0)
+    if((h.dlopen_addr = look_up_libcsymbol(h, "dlopen")) == 0)
     {
         printf("something went wrong with dlopen resolution.\n");
         exit(-1);
